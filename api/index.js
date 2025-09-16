@@ -1967,6 +1967,7 @@ app.get('/api/work-areas', async (req, res) => {
     const result = await pool.query(`
       SELECT
         wa.*,
+        p.name as project_name,
         COUNT(DISTINCT awa.worker_id) as assigned_workers_count,
         COALESCE(json_agg(DISTINCT
           jsonb_build_object(
@@ -1978,6 +1979,8 @@ app.get('/api/work-areas', async (req, res) => {
         COUNT(DISTINCT ap.id) as photos_count,
         COUNT(DISTINCT ad.id) as documents_count
       FROM work_areas wa
+      LEFT JOIN projects p
+        ON wa.project_id = p.id
       LEFT JOIN area_worker_assignments awa
         ON wa.id = awa.work_area_id
         AND awa.assignment_date = CURRENT_DATE
@@ -1987,7 +1990,7 @@ app.get('/api/work-areas', async (req, res) => {
         ON wa.id = ap.work_area_id
       LEFT JOIN area_documents ad
         ON wa.id = ad.work_area_id
-      GROUP BY wa.id
+      GROUP BY wa.id, p.name
       ORDER BY wa.created_at DESC
     `);
 
@@ -2242,6 +2245,29 @@ app.get('/api/workers/signed-in', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching signed-in workers:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get workers signed into a specific project
+app.get('/api/projects/:projectId/signed-in-workers', async (req, res) => {
+  const { projectId } = req.params;
+  const today = getEasternDate();
+
+  try {
+    const result = await pool.query(`
+      SELECT DISTINCT u.id, u.name, u.role
+      FROM users u
+      JOIN worker_signins ws ON LOWER(u.name) = LOWER(ws.worker_name)
+      WHERE ws.signin_date = $1
+        AND ws.project_id = $2
+        AND ws.signout_time IS NULL
+      ORDER BY u.name
+    `, [today, projectId]);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching project signed-in workers:', err);
     res.status(500).json({ error: err.message });
   }
 });
