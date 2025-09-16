@@ -1,0 +1,27 @@
+{
+  "name": "jsa-backend",
+  "version": "1.0.0",
+  "description": "JSA Management System Backend API",
+  "main": "server.cjs",
+  "scripts": {
+    "start": "node server-postgres.cjs",
+    "start:sqlite": "node server.cjs",
+    "dev": "nodemon server-postgres.cjs"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "node-cron": "^4.2.1",
+    "nodemailer": "^7.0.6",
+    "pg": "^8.11.3",
+    "socket.io": "^4.8.1",
+    "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

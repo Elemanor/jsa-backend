@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.local
+jsa_database.db
+*.log
+.DS_Store
+dist/
+build/
+.vercel
