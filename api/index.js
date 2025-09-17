@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
+const { generatePresignedUrl, uploadToS3 } = require('./s3-upload');
 
 // Helper function to get EST/EDT date
 function getEasternDate() {
@@ -33,13 +34,38 @@ app.use(cors({
   origin: corsOrigins,
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
+  preflightContinue: false,
+  optionsSuccessStatus: 200
 }));
 app.use(express.json());
 
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Add Gustavo Mendez to workers if not exists
+app.get('/api/workers/init-gustavo', async (req, res) => {
+  try {
+    // Check if Gustavo already exists
+    const check = await pool.query(
+      "SELECT id FROM users WHERE LOWER(name) = LOWER('Gustavo Mendez')"
+    );
+
+    if (check.rows.length === 0) {
+      // Add Gustavo Mendez
+      await pool.query(
+        "INSERT INTO users (name, role) VALUES ($1, $2)",
+        ['Gustavo Mendez', 'worker']
+      );
+      res.json({ message: 'Gustavo Mendez added successfully' });
+    } else {
+      res.json({ message: 'Gustavo Mendez already exists' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Helper function to save form updates
@@ -2004,11 +2030,19 @@ app.get('/api/work-areas', async (req, res) => {
 // Get single work area with details
 app.get('/api/work-areas/:id', async (req, res) => {
   const { id } = req.params;
+
+  // Validate work area ID
+  if (!id || id === 'undefined' || id === 'null') {
+    return res.status(400).json({ error: 'Valid work area ID is required' });
+  }
+
   try {
-    const areaResult = await pool.query(
-      'SELECT * FROM work_areas WHERE id = $1',
-      [id]
-    );
+    const areaResult = await pool.query(`
+      SELECT wa.*, p.name as project_name
+      FROM work_areas wa
+      LEFT JOIN projects p ON wa.project_id = p.id
+      WHERE wa.id = $1
+    `, [id]);
 
     if (areaResult.rows.length === 0) {
       return res.status(404).json({ error: 'Work area not found' });
@@ -2074,10 +2108,90 @@ app.post('/api/work-areas', async (req, res) => {
   }
 });
 
+// Update work area
+app.patch('/api/work-areas/:id', async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+
+  try {
+    // Build dynamic update query
+    const updateFields = [];
+    const values = [];
+    let paramIndex = 1;
+
+    Object.keys(updates).forEach(key => {
+      // Convert camelCase to snake_case
+      const dbKey = key.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+      updateFields.push(`${dbKey} = $${paramIndex}`);
+      values.push(updates[key]);
+      paramIndex++;
+    });
+
+    if (updateFields.length === 0) {
+      return res.status(400).json({ error: 'No updates provided' });
+    }
+
+    values.push(id);
+
+    const result = await pool.query(`
+      UPDATE work_areas
+      SET ${updateFields.join(', ')}
+      WHERE id = $${paramIndex}
+      RETURNING *
+    `, values);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Work area not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error updating work area:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete work area
+app.delete('/api/work-areas/:id', async (req, res) => {
+  const { id } = req.params;
+
+  // Validate work area ID
+  if (!id || id === 'undefined' || id === 'null') {
+    return res.status(400).json({ error: 'Valid work area ID is required' });
+  }
+
+  try {
+    // This will cascade delete all related records (photos, documents, activities, assignments)
+    const result = await pool.query(
+      'DELETE FROM work_areas WHERE id = $1 RETURNING *',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Work area not found' });
+    }
+
+    res.json({ message: 'Work area deleted successfully', deleted: result.rows[0] });
+  } catch (err) {
+    console.error('Error deleting work area:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Update work area stage
 app.put('/api/work-areas/:id/stage', async (req, res) => {
   const { id } = req.params;
   const { stage } = req.body;
+
+  // Validate work area ID
+  if (!id || id === 'undefined' || id === 'null') {
+    return res.status(400).json({ error: 'Valid work area ID is required' });
+  }
+
+  // Validate stage
+  if (!stage) {
+    return res.status(400).json({ error: 'Stage is required' });
+  }
 
   try {
     // Update stage
@@ -2110,6 +2224,16 @@ app.post('/api/work-areas/:id/assign-workers', async (req, res) => {
   const { id } = req.params;
   const { workerIds, date } = req.body;
   const assignmentDate = date || getEasternDate();
+
+  // Validate work area ID
+  if (!id || id === 'undefined' || id === 'null') {
+    return res.status(400).json({ error: 'Valid work area ID is required' });
+  }
+
+  // Validate worker IDs
+  if (!workerIds || !Array.isArray(workerIds)) {
+    return res.status(400).json({ error: 'Worker IDs array is required' });
+  }
 
   const client = await pool.connect();
   try {
@@ -2159,12 +2283,60 @@ app.post('/api/work-areas/:id/assign-workers', async (req, res) => {
   }
 });
 
-// Upload photo for work area
+// Note: Server-side upload removed in favor of presigned URLs for better performance and reliability
+
+// Generate presigned URL for general photo uploads
+app.post('/api/photos/presigned-url', async (req, res) => {
+  const { fileName, fileType } = req.body;
+
+  if (!fileName || !fileType) {
+    return res.status(400).json({ error: 'File name and file type are required' });
+  }
+
+  try {
+    const result = await generatePresignedUrl(fileName, fileType, 'general');
+    res.json(result);
+  } catch (err) {
+    console.error('Error generating presigned URL:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get presigned URL for direct upload from browser
+app.post('/api/work-areas/:id/photos/presigned-url', async (req, res) => {
+  const { id } = req.params;
+  const { fileName, fileType } = req.body;
+
+  if (!id || !fileName || !fileType) {
+    return res.status(400).json({ error: 'Work area ID, file name and file type are required' });
+  }
+
+  try {
+    const result = await generatePresignedUrl(fileName, fileType, `work-areas/${id}`);
+    res.json(result);
+  } catch (err) {
+    console.error('Error generating presigned URL:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Original endpoint for backward compatibility (accepts base64)
 app.post('/api/work-areas/:id/photos', async (req, res) => {
   const { id } = req.params;
   const { photoUrl, thumbnailUrl, caption, takenBy, latitude, longitude, locationAddress, dailyActivityId } = req.body;
 
+  // Validate work area ID
+  if (!id || id === 'undefined' || id === 'null') {
+    return res.status(400).json({ error: 'Valid work area ID is required' });
+  }
+
   try {
+    // First check if work area exists
+    const workAreaCheck = await pool.query('SELECT id FROM work_areas WHERE id = $1', [id]);
+    if (workAreaCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Work area not found' });
+    }
+
     const result = await pool.query(`
       INSERT INTO area_photos
       (work_area_id, photo_url, thumbnail_url, caption, taken_by_name,
@@ -2172,6 +2344,12 @@ app.post('/api/work-areas/:id/photos', async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *
     `, [id, photoUrl, thumbnailUrl, caption, takenBy, latitude, longitude, locationAddress, dailyActivityId]);
+
+    // Set explicit CORS headers for this response
+    res.header('Access-Control-Allow-Origin', req.headers.origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
 
     res.json(result.rows[0]);
   } catch (err) {
@@ -2185,7 +2363,22 @@ app.post('/api/work-areas/:id/documents', async (req, res) => {
   const { id } = req.params;
   const { documentType, name, fileUrl, fileSize, fileType, uploadedBy, description } = req.body;
 
+  // Validate work area ID
+  if (!id || id === 'undefined' || id === 'null') {
+    return res.status(400).json({ error: 'Valid work area ID is required' });
+  }
+
+  // Validate required fields
+  if (!fileUrl || !name) {
+    return res.status(400).json({ error: 'File URL and name are required' });
+  }
+
   try {
+    // First check if work area exists
+    const workAreaCheck = await pool.query('SELECT id FROM work_areas WHERE id = $1', [id]);
+    if (workAreaCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Work area not found' });
+    }
     const result = await pool.query(`
       INSERT INTO area_documents
       (work_area_id, document_type, name, file_url, file_size, file_type,
@@ -2201,13 +2394,81 @@ app.post('/api/work-areas/:id/documents', async (req, res) => {
   }
 });
 
+// Get daily activity for a specific date
+app.get('/api/work-areas/:id/daily-activity', async (req, res) => {
+  const { id } = req.params;
+  const { date } = req.query;
+  const activityDate = date || getEasternDate();
+
+  // Validate work area ID
+  if (!id || id === 'undefined' || id === 'null') {
+    return res.status(400).json({ error: 'Valid work area ID is required' });
+  }
+
+  try {
+    // First check if work area exists
+    const workAreaCheck = await pool.query('SELECT id FROM work_areas WHERE id = $1', [id]);
+    if (workAreaCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Work area not found' });
+    }
+
+    const result = await pool.query(`
+      SELECT da.*,
+        COALESCE(json_agg(DISTINCT
+          jsonb_build_object(
+            'id', ap.id,
+            'url', ap.photo_url,
+            'thumbnailUrl', ap.thumbnail_url,
+            'caption', ap.caption,
+            'takenAt', ap.taken_at
+          )
+        ) FILTER (WHERE ap.id IS NOT NULL), '[]'::json) as photos
+      FROM daily_activities da
+      LEFT JOIN area_photos ap
+        ON da.work_area_id = ap.work_area_id
+        AND DATE(ap.taken_at) = da.activity_date
+      WHERE da.work_area_id = $1 AND da.activity_date = $2
+      GROUP BY da.id
+    `, [id, activityDate]);
+
+    if (result.rows.length === 0) {
+      // Return empty activity data instead of 404 - this allows frontend to handle gracefully
+      return res.json({
+        work_area_id: parseInt(id),
+        activity_date: activityDate,
+        stage: null,
+        description: null,
+        weather: null,
+        temperature: null,
+        notes: null,
+        photos: []
+      });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error fetching daily activity:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Create or update daily activity
 app.post('/api/work-areas/:id/daily-activity', async (req, res) => {
   const { id } = req.params;
   const { activityDate, stage, description, weather, temperature, notes, createdBy } = req.body;
   const date = activityDate || getEasternDate();
 
+  // Validate work area ID
+  if (!id || id === 'undefined' || id === 'null') {
+    return res.status(400).json({ error: 'Valid work area ID is required' });
+  }
+
   try {
+    // First check if work area exists
+    const workAreaCheck = await pool.query('SELECT id FROM work_areas WHERE id = $1', [id]);
+    if (workAreaCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Work area not found' });
+    }
     const result = await pool.query(`
       INSERT INTO daily_activities
       (work_area_id, activity_date, stage, description, weather, temperature, notes, created_by)
@@ -2231,16 +2492,17 @@ app.post('/api/work-areas/:id/daily-activity', async (req, res) => {
 
 // Get signed-in workers (for assignment dropdown)
 app.get('/api/workers/signed-in', async (req, res) => {
-  const today = getEasternDate();
+  const { date } = req.query;
+  const targetDate = date || getEasternDate();
 
   try {
     const result = await pool.query(`
-      SELECT DISTINCT u.id, u.name, u.role
+      SELECT DISTINCT u.id, u.name, u.role, ws.signin_time as "signInTime"
       FROM users u
       JOIN worker_signins ws ON LOWER(u.name) = LOWER(ws.worker_name)
       WHERE ws.signin_date = $1 AND ws.signout_time IS NULL
       ORDER BY u.name
-    `, [today]);
+    `, [targetDate]);
 
     res.json(result.rows);
   } catch (err) {
@@ -2253,6 +2515,11 @@ app.get('/api/workers/signed-in', async (req, res) => {
 app.get('/api/projects/:projectId/signed-in-workers', async (req, res) => {
   const { projectId } = req.params;
   const today = getEasternDate();
+
+  // Validate projectId
+  if (!projectId || projectId === 'undefined' || projectId === 'null') {
+    return res.status(400).json({ error: 'Valid project ID is required' });
+  }
 
   try {
     const result = await pool.query(`
@@ -2271,6 +2538,279 @@ app.get('/api/projects/:projectId/signed-in-workers', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+// Read-only database query execution (restricted to SELECT only)
+app.post('/api/database/query', async (req, res) => {
+  const { query, params = [] } = req.body;
+
+  // Security: Only allow SELECT queries
+  const normalizedQuery = query.trim().toUpperCase();
+  if (!normalizedQuery.startsWith('SELECT') && !normalizedQuery.startsWith('WITH')) {
+    return res.status(403).json({
+      error: 'Only SELECT queries are allowed for security reasons'
+    });
+  }
+
+  // Forbidden keywords for security
+  const forbidden = ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER', 'TRUNCATE', 'GRANT', 'REVOKE'];
+  if (forbidden.some(keyword => normalizedQuery.includes(keyword))) {
+    return res.status(403).json({
+      error: 'Query contains forbidden operations'
+    });
+  }
+
+  try {
+    const startTime = Date.now();
+    const result = await pool.query(query, params);
+    const executionTime = Date.now() - startTime;
+
+    res.json({
+      success: true,
+      rows: result.rows,
+      rowCount: result.rowCount,
+      fields: result.fields?.map(f => ({ name: f.name, dataType: f.dataTypeID })),
+      executionTime,
+      query: query.substring(0, 500) // Return first 500 chars of query
+    });
+  } catch (err) {
+    console.error('Query execution error:', err);
+    res.status(400).json({
+      error: err.message,
+      hint: err.hint || 'Check your SQL syntax',
+      position: err.position
+    });
+  }
+});
+
+// Get database statistics
+app.get('/api/database/stats', async (req, res) => {
+  try {
+    // Get table sizes
+    const tableSizes = await pool.query(`
+      SELECT
+        schemaname,
+        tablename,
+        pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS size,
+        pg_total_relation_size(schemaname||'.'||tablename) AS size_bytes
+      FROM pg_tables
+      WHERE schemaname = 'public'
+      ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC
+    `);
+
+    // Get row counts
+    const tables = tableSizes.rows.map(t => t.tablename);
+    const rowCounts = {};
+
+    for (const table of tables) {
+      try {
+        const count = await pool.query(`SELECT COUNT(*) FROM ${table}`);
+        rowCounts[table] = parseInt(count.rows[0].count);
+      } catch (err) {
+        rowCounts[table] = 0;
+      }
+    }
+
+    // Get index information
+    const indexes = await pool.query(`
+      SELECT
+        tablename,
+        indexname,
+        indexdef
+      FROM pg_indexes
+      WHERE schemaname = 'public'
+      ORDER BY tablename, indexname
+    `);
+
+    res.json({
+      tables: tableSizes.rows.map(t => ({
+        ...t,
+        rowCount: rowCounts[t.tablename] || 0
+      })),
+      indexes: indexes.rows,
+      totalSize: tableSizes.rows.reduce((acc, t) => acc + parseInt(t.size_bytes), 0)
+    });
+  } catch (err) {
+    console.error('Error fetching database stats:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Analyze query performance
+app.post('/api/database/explain', async (req, res) => {
+  const { query } = req.body;
+
+  // Security check
+  const normalizedQuery = query.trim().toUpperCase();
+  if (!normalizedQuery.startsWith('SELECT') && !normalizedQuery.startsWith('WITH')) {
+    return res.status(403).json({
+      error: 'Only SELECT queries can be analyzed'
+    });
+  }
+
+  try {
+    const explainResult = await pool.query(`EXPLAIN ANALYZE ${query}`);
+    const planResult = await pool.query(`EXPLAIN (FORMAT JSON) ${query}`);
+
+    res.json({
+      executionPlan: explainResult.rows.map(r => r['QUERY PLAN']),
+      jsonPlan: planResult.rows[0]['QUERY PLAN'],
+      suggestions: analyzeQueryPlan(planResult.rows[0]['QUERY PLAN'])
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Helper function to analyze query plan
+function analyzeQueryPlan(plan) {
+  const suggestions = [];
+  const planStr = JSON.stringify(plan);
+
+  if (planStr.includes('Seq Scan')) {
+    suggestions.push('Consider adding indexes to avoid sequential scans');
+  }
+  if (planStr.includes('Nested Loop')) {
+    suggestions.push('Large nested loops detected - consider query optimization');
+  }
+  if (planStr.includes('Sort')) {
+    suggestions.push('Sorting detected - ensure indexes on ORDER BY columns');
+  }
+
+  return suggestions;
+}
+
+// Weather API endpoints
+app.get('/api/weather', async (req, res) => {
+  const { date } = req.query;
+
+  try {
+    if (date) {
+      // Get weather for specific date
+      const result = await pool.query(
+        `SELECT * FROM weather_data WHERE date = $1`,
+        [date]
+      );
+
+      if (result.rows.length > 0) {
+        res.json(result.rows[0]);
+      } else {
+        res.json(null);
+      }
+    } else {
+      // Get recent weather data (last 30 days)
+      const result = await pool.query(
+        `SELECT * FROM weather_data
+         WHERE date >= CURRENT_DATE - INTERVAL '30 days'
+         ORDER BY date DESC`
+      );
+
+      res.json(result.rows);
+    }
+  } catch (err) {
+    console.error('Error fetching weather:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/weather', async (req, res) => {
+  const {
+    date,
+    temperature_high,
+    temperature_low,
+    humidity,
+    wind_speed_kmh,
+    wind_gust_kmh,
+    condition,
+    precipitation_mm,
+    location,
+    is_manual_entry
+  } = req.body;
+
+  try {
+    // First ensure the weather_data table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS weather_data (
+        id SERIAL PRIMARY KEY,
+        date DATE UNIQUE NOT NULL,
+        temperature_high REAL,
+        temperature_low REAL,
+        temperature_avg REAL,
+        feels_like REAL,
+        humidity INTEGER,
+        precipitation_mm REAL,
+        precipitation_type TEXT,
+        wind_speed_kmh REAL,
+        wind_gust_kmh REAL,
+        wind_direction TEXT,
+        pressure_mb REAL,
+        visibility_km REAL,
+        condition TEXT,
+        condition_code TEXT,
+        uv_index INTEGER,
+        sunrise TEXT,
+        sunset TEXT,
+        location TEXT DEFAULT 'Mississauga, Ontario',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        is_manual_entry BOOLEAN DEFAULT false
+      )
+    `);
+
+    // Calculate temperature average
+    const temperature_avg = (temperature_high + temperature_low) / 2;
+    const feels_like = temperature_avg; // Simple approximation
+
+    // Insert or update weather data
+    const result = await pool.query(
+      `INSERT INTO weather_data (
+        date, temperature_high, temperature_low, temperature_avg, feels_like,
+        humidity, wind_speed_kmh, wind_gust_kmh, condition, precipitation_mm,
+        location, is_manual_entry, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
+      ON CONFLICT (date) DO UPDATE SET
+        temperature_high = EXCLUDED.temperature_high,
+        temperature_low = EXCLUDED.temperature_low,
+        temperature_avg = EXCLUDED.temperature_avg,
+        feels_like = EXCLUDED.feels_like,
+        humidity = EXCLUDED.humidity,
+        wind_speed_kmh = EXCLUDED.wind_speed_kmh,
+        wind_gust_kmh = EXCLUDED.wind_gust_kmh,
+        condition = EXCLUDED.condition,
+        precipitation_mm = EXCLUDED.precipitation_mm,
+        location = EXCLUDED.location,
+        is_manual_entry = EXCLUDED.is_manual_entry,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING *`,
+      [
+        date,
+        temperature_high,
+        temperature_low,
+        temperature_avg,
+        feels_like,
+        humidity,
+        wind_speed_kmh,
+        wind_gust_kmh,
+        condition,
+        precipitation_mm,
+        location || 'Mississauga, Ontario',
+        is_manual_entry || true
+      ]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error saving weather:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Start server if not in Vercel environment
+if (process.env.VERCEL !== '1') {
+  const PORT = process.env.PORT || 3001;
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
 
 // Export for Vercel
 module.exports = app;
