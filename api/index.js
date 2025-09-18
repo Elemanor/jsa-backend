@@ -3466,6 +3466,30 @@ app.get('/api/gps-attendance', async (req, res) => {
 });
 
 // Material Requests endpoints
+// Get unread material requests count
+app.get('/api/material-requests/unread-count', async (req, res) => {
+  try {
+    // Ensure table has a viewed column
+    await pool.query(`
+      ALTER TABLE material_requests
+      ADD COLUMN IF NOT EXISTS viewed BOOLEAN DEFAULT FALSE
+    `);
+
+    // Count unviewed requests
+    const result = await pool.query(
+      `SELECT COUNT(*) as count
+       FROM material_requests
+       WHERE viewed = FALSE
+       AND status IN ('pending', 'approved')`
+    );
+
+    res.json({ count: parseInt(result.rows[0].count) });
+  } catch (err) {
+    console.error('Error getting unread count:', err);
+    res.json({ count: 0 });
+  }
+});
+
 app.get('/api/material-requests', async (req, res) => {
   const { status, urgency } = req.query;
 
@@ -3510,6 +3534,21 @@ app.get('/api/material-requests', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching material requests:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Mark all material requests as viewed
+app.put('/api/material-requests/mark-viewed', async (req, res) => {
+  try {
+    await pool.query(
+      `UPDATE material_requests
+       SET viewed = TRUE
+       WHERE viewed = FALSE`
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error marking requests as viewed:', err);
     res.status(500).json({ error: err.message });
   }
 });
