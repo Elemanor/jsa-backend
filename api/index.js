@@ -1100,6 +1100,84 @@ app.delete('/api/concrete-deliveries/:id', async (req, res) => {
   }
 });
 
+// Mark concrete delivery as complete with actual data
+app.put('/api/concrete-deliveries/:id/complete', async (req, res) => {
+  const { id } = req.params;
+  const { actual_volume, actual_hours, supervisor, status } = req.body;
+
+  try {
+    // First, add columns if they don't exist
+    await pool.query(`
+      ALTER TABLE concrete_deliveries
+      ADD COLUMN IF NOT EXISTS actual_volume DECIMAL(10,2),
+      ADD COLUMN IF NOT EXISTS actual_hours DECIMAL(10,2),
+      ADD COLUMN IF NOT EXISTS supervisor VARCHAR(255)
+    `);
+
+    // Update the delivery with actual data
+    const result = await pool.query(
+      `UPDATE concrete_deliveries
+       SET status = $1, actual_volume = $2, actual_hours = $3, supervisor = $4
+       WHERE id = $5
+       RETURNING *`,
+      [status || 'delivered', actual_volume, actual_hours, supervisor, id]
+    );
+
+    if (result.rows.length === 0) {
+      res.status(404).json({ error: 'Delivery not found' });
+    } else {
+      // Also create or update a concrete pour record for tracking
+      const delivery = result.rows[0];
+
+      // Check if a pour record exists for this delivery
+      const pourCheck = await pool.query(
+        `SELECT id FROM concrete_pours
+         WHERE DATE(pour_date) = DATE($1)
+         AND project_name = $2
+         AND area = $3`,
+        [delivery.delivery_date, delivery.project_name, delivery.area]
+      );
+
+      if (pourCheck.rows.length > 0) {
+        // Update existing pour record
+        await pool.query(
+          `UPDATE concrete_pours
+           SET actual_volume = COALESCE(actual_volume, 0) + $1,
+               actual_end = NOW(),
+               supervisor = $2,
+               status = 'completed'
+           WHERE id = $3`,
+          [actual_volume, supervisor, pourCheck.rows[0].id]
+        );
+      } else {
+        // Create new pour record
+        await pool.query(
+          `INSERT INTO concrete_pours
+           (project_name, pour_date, area, planned_volume, actual_volume,
+            planned_start, planned_end, actual_start, actual_end,
+            concrete_type, supplier, supervisor, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $6, NOW(), NOW(), $7, 'Local Supplier', $8, 'completed')`,
+          [
+            delivery.project_name,
+            delivery.delivery_date,
+            delivery.area,
+            delivery.quantity,
+            actual_volume,
+            delivery.delivery_time ? `${delivery.delivery_date} ${delivery.delivery_time}` : delivery.delivery_date,
+            delivery.concrete_type,
+            supervisor
+          ]
+        );
+      }
+
+      res.json(result.rows[0]);
+    }
+  } catch (err) {
+    console.error('Error marking delivery complete:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Get form by ID
 app.get('/api/forms/:formId', async (req, res) => {
   const { formId } = req.params;
