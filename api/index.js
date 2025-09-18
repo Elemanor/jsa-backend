@@ -487,10 +487,18 @@ app.post('/api/worker/signin', async (req, res) => {
       return res.status(400).json({ error: 'Already signed in today' });
     }
 
+    // Add location columns if they don't exist
+    await pool.query(`
+      ALTER TABLE worker_signins
+      ADD COLUMN IF NOT EXISTS signin_latitude DECIMAL(10, 8),
+      ADD COLUMN IF NOT EXISTS signin_longitude DECIMAL(11, 8),
+      ADD COLUMN IF NOT EXISTS signin_address TEXT
+    `).catch(() => {});
+
     // Use the correctly capitalized name for the insert
     const result = await pool.query(
-      'INSERT INTO worker_signins (worker_name, project_id, project_name, site_address, signin_date) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-      [actualWorkerName, projectId, projectName, siteAddress, signinDate]
+      'INSERT INTO worker_signins (worker_name, project_id, project_name, site_address, signin_date, signin_latitude, signin_longitude, signin_address) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id',
+      [actualWorkerName, projectId, projectName, siteAddress, signinDate, latitude || null, longitude || null, address || null]
     );
 
     // Automatically mark attendance as present when signing in
@@ -3321,6 +3329,29 @@ app.post('/api/attendance/mark', async (req, res) => {
   }
 });
 
+// Get GPS attendance data
+app.get('/api/gps-attendance', async (req, res) => {
+  const today = getEasternDate();
+
+  try {
+    const result = await pool.query(
+      `SELECT *,
+       signin_latitude as latitude,
+       signin_longitude as longitude,
+       signin_address as location_address
+       FROM worker_signins
+       WHERE signin_date = $1 AND signin_latitude IS NOT NULL AND signin_longitude IS NOT NULL
+       ORDER BY signin_time DESC`,
+      [today]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching GPS attendance:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Material Requests endpoints
 app.get('/api/material-requests', async (req, res) => {
   const { status, urgency } = req.query;
@@ -3592,6 +3623,143 @@ app.get('/api/workers/:workerId/timesheet-summary', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching timesheet summary:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Concrete Pour Tracking
+app.get('/api/concrete-pours', async (req, res) => {
+  try {
+    // Create table if not exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS concrete_pours (
+        id SERIAL PRIMARY KEY,
+        project_id INTEGER,
+        project_name TEXT,
+        pour_date DATE,
+        location TEXT,
+        planned_volume DECIMAL(10,2),
+        actual_volume DECIMAL(10,2),
+        planned_start TIME,
+        actual_start TIMESTAMP,
+        planned_end TIME,
+        actual_end TIMESTAMP,
+        supplier TEXT,
+        mix_type TEXT,
+        slump TEXT,
+        weather_conditions TEXT,
+        temperature DECIMAL(5,2),
+        crew_size INTEGER,
+        pump_type TEXT,
+        notes TEXT,
+        status VARCHAR(50) DEFAULT 'scheduled',
+        created_by TEXT,
+        completed_by TEXT,
+        completion_notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `).catch(() => {});
+
+    const result = await pool.query(
+      'SELECT * FROM concrete_pours ORDER BY pour_date DESC, created_at DESC'
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching concrete pours:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/concrete-pours', async (req, res) => {
+  const {
+    project_name, pour_date, location, planned_volume,
+    planned_start, planned_end, supplier, mix_type,
+    crew_size, pump_type, notes, created_by
+  } = req.body;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO concrete_pours (
+        project_name, pour_date, location, planned_volume,
+        planned_start, planned_end, supplier, mix_type,
+        crew_size, pump_type, notes, status, created_by
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      RETURNING *`,
+      [
+        project_name, pour_date, location, planned_volume,
+        planned_start, planned_end, supplier, mix_type,
+        crew_size || null, pump_type || null, notes || null,
+        'scheduled', created_by
+      ]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error creating concrete pour:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/concrete-pours/:id', async (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+
+  try {
+    // Build dynamic update query
+    const setClause = [];
+    const values = [];
+    let paramCount = 1;
+
+    Object.keys(updates).forEach(key => {
+      if (updates[key] !== undefined && updates[key] !== null) {
+        setClause.push(`${key} = $${paramCount}`);
+        values.push(updates[key]);
+        paramCount++;
+      }
+    });
+
+    if (setClause.length === 0) {
+      return res.status(400).json({ error: 'No updates provided' });
+    }
+
+    values.push(id);
+
+    const result = await pool.query(
+      `UPDATE concrete_pours
+       SET ${setClause.join(', ')}
+       WHERE id = $${paramCount}
+       RETURNING *`,
+      values
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Concrete pour not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error updating concrete pour:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/concrete-pours/:id', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const result = await pool.query(
+      'DELETE FROM concrete_pours WHERE id = $1 RETURNING *',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Concrete pour not found' });
+    }
+
+    res.json({ success: true, deleted: result.rows[0] });
+  } catch (err) {
+    console.error('Error deleting concrete pour:', err);
     res.status(500).json({ error: err.message });
   }
 });

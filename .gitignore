@@ -7,3 +7,4 @@ jsa_database.db
 dist/
 build/
 .vercel
+.env*.local
