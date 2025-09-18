@@ -2017,6 +2017,41 @@ app.post('/api/auto-signout', async (req, res) => {
   }
 });
 
+// Get worker signin status
+app.get('/api/worker/signin-status/:workerId', async (req, res) => {
+  const { workerId } = req.params;
+  const today = getEasternDate();
+
+  try {
+    // Check if worker is currently signed in
+    const result = await pool.query(
+      `SELECT ws.*, u.name as worker_name
+       FROM worker_signins ws
+       LEFT JOIN users u ON u.id = $1
+       WHERE (ws.worker_name = u.name OR ws.worker_name = $1)
+       AND ws.signin_date = $2
+       AND ws.signout_time IS NULL
+       ORDER BY ws.signin_time DESC
+       LIMIT 1`,
+      [workerId, today]
+    );
+
+    if (result.rows.length > 0) {
+      res.json({
+        signed_in: true,
+        signin_time: result.rows[0].signin_time,
+        project_name: result.rows[0].project_name,
+        site_address: result.rows[0].site_address
+      });
+    } else {
+      res.json({ signed_in: false });
+    }
+  } catch (err) {
+    console.error('Error checking signin status:', err);
+    res.json({ signed_in: false });
+  }
+});
+
 // Manual sign-out endpoint for specific worker
 app.post('/api/worker/signout', async (req, res) => {
   const { workerName, projectName } = req.body;
