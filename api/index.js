@@ -3809,22 +3809,24 @@ app.get('/api/workers/:workerId/timesheet-summary', async (req, res) => {
 // Concrete Pour Tracking
 app.get('/api/concrete-pours', async (req, res) => {
   try {
-    // Create table if not exists
+    // Create table if not exists with consistent structure
     await pool.query(`
       CREATE TABLE IF NOT EXISTS concrete_pours (
         id SERIAL PRIMARY KEY,
-        project_id INTEGER,
-        project_name TEXT,
+        project_name VARCHAR(255),
         pour_date DATE,
+        area VARCHAR(255),
         location TEXT,
         planned_volume DECIMAL(10,2),
         actual_volume DECIMAL(10,2),
-        planned_start TIME,
+        planned_start TIMESTAMP,
+        planned_end TIMESTAMP,
         actual_start TIMESTAMP,
-        planned_end TIME,
         actual_end TIMESTAMP,
-        supplier TEXT,
+        concrete_type VARCHAR(100),
         mix_type TEXT,
+        supplier VARCHAR(255),
+        supervisor VARCHAR(255),
         slump TEXT,
         weather_conditions TEXT,
         temperature DECIMAL(5,2),
