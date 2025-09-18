@@ -33,7 +33,7 @@ const corsOrigins = process.env.FRONTEND_URL
 app.use(cors({
   origin: corsOrigins,
   credentials: true,
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
   preflightContinue: false,
   optionsSuccessStatus: 200
@@ -62,6 +62,57 @@ app.get('/api/workers/init-gustavo', async (req, res) => {
       res.json({ message: 'Gustavo Mendez added successfully' });
     } else {
       res.json({ message: 'Gustavo Mendez already exists' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Add David Peniche to workers if not exists
+app.get('/api/workers/init-david', async (req, res) => {
+  try {
+    // Check if David Peniche already exists
+    const check = await pool.query(
+      "SELECT id FROM users WHERE LOWER(name) = LOWER('David Peniche')"
+    );
+
+    if (check.rows.length === 0) {
+      // Add David Peniche with PIN
+      await pool.query(
+        "INSERT INTO users (name, role, pin) VALUES ($1, $2, $3)",
+        ['David Peniche', 'worker', '1234']
+      );
+      res.json({ message: 'David Peniche added successfully' });
+    } else {
+      res.json({ message: 'David Peniche already exists' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Add Mota Marques to workers if not exists
+app.get('/api/workers/init-mota', async (req, res) => {
+  try {
+    // Check if Mota Marques already exists
+    const check = await pool.query(
+      "SELECT id FROM users WHERE LOWER(name) = LOWER('Mota Marques')"
+    );
+
+    if (check.rows.length === 0) {
+      // Add Mota Marques with PIN
+      await pool.query(
+        "INSERT INTO users (name, role, pin) VALUES ($1, $2, $3)",
+        ['Mota Marques', 'worker', '1111']
+      );
+      res.json({ message: 'Mota Marques added successfully' });
+    } else {
+      // Update PIN for existing Mota Marques
+      await pool.query(
+        "UPDATE users SET pin = $1 WHERE LOWER(name) = LOWER('Mota Marques')",
+        ['1111']
+      );
+      res.json({ message: 'Mota Marques PIN updated' });
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -404,10 +455,17 @@ app.post('/api/auth/login', async (req, res) => {
 
 // Worker sign-in
 app.post('/api/worker/signin', async (req, res) => {
-  const { workerName, projectId, projectName, siteAddress, latitude, longitude, address } = req.body;
+  // Support both workerName and worker_name for backward compatibility
+  const workerName = req.body.workerName || req.body.worker_name;
+  const projectId = req.body.projectId || req.body.project_id;
+  const projectName = req.body.projectName || req.body.project_name;
+  const siteAddress = req.body.siteAddress || req.body.site_address;
+  const signatureImage = req.body.signature_image || req.body.signatureImage;
+  const { latitude, longitude, address } = req.body;
+
   const signinDate = getEasternDate();
 
-  console.log('Worker sign-in attempt:', { workerName, projectName, hasLocation: !!(latitude && longitude) });
+  console.log('Worker sign-in attempt:', { workerName, projectName, hasLocation: !!(latitude && longitude), hasSignature: !!signatureImage });
 
   try {
     // First, get the correct capitalization of the worker name from users table
@@ -623,35 +681,6 @@ app.get('/api/worker/signins/:workerId', async (req, res) => {
   }
 });
 
-// Worker sign out
-app.post('/api/worker/signout', async (req, res) => {
-  const { workerId, projectName } = req.body;
-  const today = getEasternDate();
-
-  try {
-    // Get worker name
-    const userResult = await pool.query('SELECT name FROM users WHERE id = $1', [workerId]);
-    if (userResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Worker not found' });
-    }
-    const workerName = userResult.rows[0].name;
-
-    // Update sign out time
-    const result = await pool.query(
-      'UPDATE worker_signins SET signout_time = NOW() WHERE worker_name = $1 AND project_name = $2 AND signin_date = $3 AND signout_time IS NULL RETURNING *',
-      [workerName, projectName, today]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'No active sign-in found' });
-    }
-
-    res.json({ success: true, signout: result.rows[0] });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
 // Get worker timesheets
 app.get('/api/timesheets/worker/:workerId', async (req, res) => {
   const { workerId } = req.params;
@@ -697,9 +726,34 @@ app.post('/api/timesheets', async (req, res) => {
   const { worker_id, worker_name, date, project_name, start_time, end_time, break_duration, total_hours, notes } = req.body;
 
   try {
+    // Calculate week number (Sunday-based week)
+    const timesheetDate = new Date(date);
+    const startOfYear = new Date(timesheetDate.getFullYear(), 0, 1);
+    const startOfYearDay = startOfYear.getDay();
+
+    // Find the first Sunday of the year
+    const daysToFirstSunday = startOfYearDay === 0 ? 0 : 7 - startOfYearDay;
+    const firstSunday = new Date(startOfYear.getTime() + daysToFirstSunday * 86400000);
+
+    // Calculate weeks from first Sunday
+    const diffDays = Math.floor((timesheetDate.getTime() - firstSunday.getTime()) / 86400000);
+    const weekNumber = Math.max(1, Math.floor(diffDays / 7) + 1);
+
+    // First ensure the week_number column exists
+    await pool.query(`
+      ALTER TABLE timesheets
+      ADD COLUMN IF NOT EXISTS week_number INTEGER
+    `).catch(() => {
+      // Column might already exist, ignore error
+    });
+
+    // Calculate regular and overtime hours
+    const regularHours = Math.min(total_hours, 8);
+    const overtimeHours = Math.max(total_hours - 8, 0);
+
     const result = await pool.query(
-      'INSERT INTO timesheets (worker_id, worker_name, date, project_name, start_time, end_time, break_duration, total_hours, notes) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *',
-      [worker_id, worker_name, date, project_name, start_time, end_time, break_duration || 0, total_hours, notes || '']
+      'INSERT INTO timesheets (worker_id, worker_name, date, project_name, start_time, end_time, break_duration, total_hours, regular_hours, overtime_hours, notes, week_number) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *',
+      [worker_id, worker_name, date, project_name, start_time, end_time, break_duration || 0, total_hours, regularHours, overtimeHours, notes || '', weekNumber]
     );
 
     // Automatically mark attendance as present when submitting timesheet
@@ -1185,7 +1239,51 @@ app.get('/api/timesheets', async (req, res) => {
   const { week, year, worker_id, worker_name } = req.query;
 
   try {
-    let query = 'SELECT * FROM timesheets WHERE 1=1';
+    // First ensure the week_number column exists and update existing records
+    await pool.query(`
+      ALTER TABLE timesheets
+      ADD COLUMN IF NOT EXISTS week_number INTEGER
+    `).catch(() => {
+      // Column might already exist, ignore error
+    });
+
+    // Add regular_hours and overtime_hours columns if they don't exist
+    await pool.query(`
+      ALTER TABLE timesheets
+      ADD COLUMN IF NOT EXISTS regular_hours DECIMAL(5,2),
+      ADD COLUMN IF NOT EXISTS overtime_hours DECIMAL(5,2)
+    `).catch(() => {
+      // Columns might already exist, ignore error
+    });
+
+    // Update existing timesheets to have week_number if they don't
+    await pool.query(`
+      UPDATE timesheets
+      SET week_number = (
+        CASE
+          WHEN EXTRACT(DOW FROM date) = 0 THEN
+            EXTRACT(WEEK FROM date - INTERVAL '1 day')
+          ELSE
+            EXTRACT(WEEK FROM date)
+        END
+      )::INTEGER
+      WHERE week_number IS NULL
+    `).catch(err => {
+      console.error('Error updating week_numbers:', err);
+    });
+
+    // Calculate regular and overtime hours for existing records
+    await pool.query(`
+      UPDATE timesheets
+      SET
+        regular_hours = LEAST(total_hours, 8),
+        overtime_hours = GREATEST(total_hours - 8, 0)
+      WHERE regular_hours IS NULL OR overtime_hours IS NULL
+    `).catch(err => {
+      console.error('Error calculating hours:', err);
+    });
+
+    let query = 'SELECT *, COALESCE(regular_hours, LEAST(total_hours, 8)) as regular_hours, COALESCE(overtime_hours, GREATEST(total_hours - 8, 0)) as overtime_hours FROM timesheets WHERE 1=1';
     let params = [];
     let paramIndex = 1;
 
@@ -1199,13 +1297,19 @@ app.get('/api/timesheets', async (req, res) => {
       params.push(worker_name);
     }
 
-    if (week) {
-      query += ` AND week_number = $${paramIndex++}`;
-      params.push(week);
-    }
+    if (week && year) {
+      // Calculate the date range for the week
+      const startOfYear = new Date(parseInt(year), 0, 1);
+      const startOfYearDay = startOfYear.getDay();
+      const daysToFirstSunday = startOfYearDay === 0 ? 0 : 7 - startOfYearDay;
+      const firstSunday = new Date(startOfYear.getTime() + daysToFirstSunday * 86400000);
 
-    if (year) {
-      // Extract year from date column if year column doesn't exist
+      const weekStart = new Date(firstSunday.getTime() + (parseInt(week) - 1) * 7 * 86400000);
+      const weekEnd = new Date(weekStart.getTime() + 6 * 86400000);
+
+      query += ` AND date >= $${paramIndex++} AND date <= $${paramIndex++}`;
+      params.push(weekStart.toISOString().split('T')[0], weekEnd.toISOString().split('T')[0]);
+    } else if (year) {
       query += ` AND EXTRACT(YEAR FROM date) = $${paramIndex++}`;
       params.push(year);
     }
@@ -1229,19 +1333,28 @@ app.get('/api/timesheets/weekly-summary', async (req, res) => {
   }
 
   try {
+    // Calculate the date range for the week
+    const startOfYear = new Date(parseInt(year), 0, 1);
+    const startOfYearDay = startOfYear.getDay();
+    const daysToFirstSunday = startOfYearDay === 0 ? 0 : 7 - startOfYearDay;
+    const firstSunday = new Date(startOfYear.getTime() + daysToFirstSunday * 86400000);
+
+    const weekStart = new Date(firstSunday.getTime() + (parseInt(week) - 1) * 7 * 86400000);
+    const weekEnd = new Date(weekStart.getTime() + 6 * 86400000);
+
     const result = await pool.query(
       `SELECT
         worker_id,
         worker_name,
-        SUM(regular_hours) as total_regular_hours,
-        SUM(overtime_hours) as total_overtime_hours,
+        SUM(COALESCE(regular_hours, LEAST(total_hours, 8))) as total_regular_hours,
+        SUM(COALESCE(overtime_hours, GREATEST(total_hours - 8, 0))) as total_overtime_hours,
         SUM(total_hours) as total_hours,
         COUNT(*) as days_worked
       FROM timesheets
-      WHERE week_number = $1 AND EXTRACT(YEAR FROM date) = $2
+      WHERE date >= $1 AND date <= $2
       GROUP BY worker_id, worker_name
       ORDER BY worker_name`,
-      [week, year]
+      [weekStart.toISOString().split('T')[0], weekEnd.toISOString().split('T')[0]]
     );
 
     res.json(result.rows);
@@ -1990,6 +2103,12 @@ app.post('/api/add-missing-users', async (req, res) => {
 // Get all work areas
 app.get('/api/work-areas', async (req, res) => {
   try {
+    // Ensure foreman_in_charge column exists
+    await pool.query(`
+      ALTER TABLE work_areas
+      ADD COLUMN IF NOT EXISTS foreman_in_charge VARCHAR(255)
+    `).catch(() => {});
+
     const result = await pool.query(`
       SELECT
         wa.*,
@@ -2037,6 +2156,12 @@ app.get('/api/work-areas/:id', async (req, res) => {
   }
 
   try {
+    // Ensure foreman_in_charge column exists
+    await pool.query(`
+      ALTER TABLE work_areas
+      ADD COLUMN IF NOT EXISTS foreman_in_charge VARCHAR(255)
+    `).catch(() => {});
+
     const areaResult = await pool.query(`
       SELECT wa.*, p.name as project_name
       FROM work_areas wa
@@ -2050,12 +2175,13 @@ app.get('/api/work-areas/:id', async (req, res) => {
 
     const area = areaResult.rows[0];
 
-    // Get assigned workers
+    // Get assigned workers (get the latest assignment, not just today)
     const workersResult = await pool.query(`
-      SELECT awa.*, u.name, u.role
+      SELECT DISTINCT ON (u.id) awa.*, u.name, u.role, u.id
       FROM area_worker_assignments awa
       JOIN users u ON awa.worker_id = u.id
-      WHERE awa.work_area_id = $1 AND awa.assignment_date = CURRENT_DATE
+      WHERE awa.work_area_id = $1
+      ORDER BY u.id, awa.assignment_date DESC
     `, [id]);
 
     // Get documents
@@ -2078,7 +2204,11 @@ app.get('/api/work-areas/:id', async (req, res) => {
 
     res.json({
       ...area,
-      assignedWorkers: workersResult.rows,
+      assigned_workers: workersResult.rows.map(w => ({
+        id: w.id,
+        name: w.name,
+        role: w.role
+      })),
       documents: docsResult.rows,
       photos: photosResult.rows,
       dailyActivities: activitiesResult.rows
@@ -2091,15 +2221,21 @@ app.get('/api/work-areas/:id', async (req, res) => {
 
 // Create new work area
 app.post('/api/work-areas', async (req, res) => {
-  const { name, description, location, startDate, currentStage, status, projectId } = req.body;
+  const { name, description, location, startDate, currentStage, status, projectId, plannedConcreteVolume, foremanInCharge } = req.body;
 
   try {
+    // First, ensure the foreman_in_charge column exists
+    await pool.query(`
+      ALTER TABLE work_areas
+      ADD COLUMN IF NOT EXISTS foreman_in_charge VARCHAR(255)
+    `).catch(() => {});
+
     const result = await pool.query(`
       INSERT INTO work_areas
-      (name, description, location, start_date, current_stage, status, project_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      (name, description, location, start_date, current_stage, status, project_id, planned_concrete_volume, foreman_in_charge)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *
-    `, [name, description, location, startDate, currentStage || 'initial_layout', status || 'active', projectId]);
+    `, [name, description, location, startDate, currentStage || 'initial_layout', status || 'active', projectId, plannedConcreteVolume || 0, foremanInCharge || 'N/A']);
 
     res.json(result.rows[0]);
   } catch (err) {
@@ -2114,6 +2250,14 @@ app.patch('/api/work-areas/:id', async (req, res) => {
   const updates = req.body;
 
   try {
+    // First, ensure the foreman_in_charge column exists if we're updating it
+    if (updates.foremanInCharge !== undefined) {
+      await pool.query(`
+        ALTER TABLE work_areas
+        ADD COLUMN IF NOT EXISTS foreman_in_charge VARCHAR(255)
+      `).catch(() => {});
+    }
+
     // Build dynamic update query
     const updateFields = [];
     const values = [];
@@ -2679,22 +2823,179 @@ function analyzeQueryPlan(plan) {
   return suggestions;
 }
 
+// Helper function to fetch weather from Open-Meteo API
+async function fetchOpenMeteoWeather(date) {
+  try {
+    // Mississauga, Ontario coordinates
+    const latitude = 43.5890;
+    const longitude = -79.6441;
+
+    // Format date for API
+    const dateStr = date || new Date().toISOString().split('T')[0];
+
+    // Open-Meteo API URL (free, no API key needed)
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max,windgusts_10m_max,weathercode&current_weather=true&timezone=America/Toronto&start_date=${dateStr}&end_date=${dateStr}`;
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error('Failed to fetch weather from Open-Meteo');
+    }
+
+    const data = await response.json();
+
+    // Map weather codes to conditions
+    const weatherCodeMap = {
+      0: 'Clear',
+      1: 'Mainly Clear',
+      2: 'Partly Cloudy',
+      3: 'Overcast',
+      45: 'Fog',
+      48: 'Fog',
+      51: 'Light Drizzle',
+      53: 'Moderate Drizzle',
+      55: 'Dense Drizzle',
+      61: 'Light Rain',
+      63: 'Moderate Rain',
+      65: 'Heavy Rain',
+      71: 'Light Snow',
+      73: 'Moderate Snow',
+      75: 'Heavy Snow',
+      77: 'Snow Grains',
+      80: 'Light Showers',
+      81: 'Moderate Showers',
+      82: 'Heavy Showers',
+      85: 'Light Snow Showers',
+      86: 'Heavy Snow Showers',
+      95: 'Thunderstorm',
+      96: 'Thunderstorm with Light Hail',
+      99: 'Thunderstorm with Heavy Hail'
+    };
+
+    if (data.daily && data.daily.temperature_2m_max && data.daily.temperature_2m_max.length > 0) {
+      const weatherCode = data.daily.weathercode[0];
+      const condition = weatherCodeMap[weatherCode] || 'Unknown';
+
+      return {
+        date: dateStr,
+        temperature_high: data.daily.temperature_2m_max[0],
+        temperature_low: data.daily.temperature_2m_min[0],
+        temperature_avg: (data.daily.temperature_2m_max[0] + data.daily.temperature_2m_min[0]) / 2,
+        feels_like: data.current_weather ? data.current_weather.temperature : (data.daily.temperature_2m_max[0] + data.daily.temperature_2m_min[0]) / 2,
+        humidity: 65, // Open-Meteo doesn't provide humidity in free tier, using default
+        precipitation_mm: data.daily.precipitation_sum[0] || 0,
+        wind_speed_kmh: data.daily.windspeed_10m_max[0],
+        wind_gust_kmh: data.daily.windgusts_10m_max[0],
+        condition: condition,
+        condition_code: weatherCode.toString(),
+        location: 'Mississauga, Ontario',
+        is_manual_entry: false
+      };
+    }
+
+    return null;
+  } catch (error) {
+    console.error('Error fetching from Open-Meteo:', error);
+    return null;
+  }
+}
+
 // Weather API endpoints
 app.get('/api/weather', async (req, res) => {
   const { date } = req.query;
 
   try {
     if (date) {
-      // Get weather for specific date
+      // First check database for cached data
       const result = await pool.query(
         `SELECT * FROM weather_data WHERE date = $1`,
         [date]
       );
 
       if (result.rows.length > 0) {
+        // Return cached data
         res.json(result.rows[0]);
       } else {
-        res.json(null);
+        // Fetch from Open-Meteo API
+        const weatherData = await fetchOpenMeteoWeather(date);
+
+        if (weatherData) {
+          // Save to database for caching
+          try {
+            // Ensure table exists
+            await pool.query(`
+              CREATE TABLE IF NOT EXISTS weather_data (
+                id SERIAL PRIMARY KEY,
+                date DATE UNIQUE NOT NULL,
+                temperature_high REAL,
+                temperature_low REAL,
+                temperature_avg REAL,
+                feels_like REAL,
+                humidity INTEGER,
+                precipitation_mm REAL,
+                precipitation_type TEXT,
+                wind_speed_kmh REAL,
+                wind_gust_kmh REAL,
+                wind_direction TEXT,
+                pressure_mb REAL,
+                visibility_km REAL,
+                condition TEXT,
+                condition_code TEXT,
+                uv_index INTEGER,
+                sunrise TEXT,
+                sunset TEXT,
+                location TEXT DEFAULT 'Mississauga, Ontario',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_manual_entry BOOLEAN DEFAULT false
+              )
+            `);
+
+            const savedResult = await pool.query(
+              `INSERT INTO weather_data (
+                date, temperature_high, temperature_low, temperature_avg, feels_like,
+                humidity, wind_speed_kmh, wind_gust_kmh, condition, condition_code,
+                precipitation_mm, location, is_manual_entry, updated_at
+              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, CURRENT_TIMESTAMP)
+              ON CONFLICT (date) DO UPDATE SET
+                temperature_high = EXCLUDED.temperature_high,
+                temperature_low = EXCLUDED.temperature_low,
+                temperature_avg = EXCLUDED.temperature_avg,
+                feels_like = EXCLUDED.feels_like,
+                humidity = EXCLUDED.humidity,
+                wind_speed_kmh = EXCLUDED.wind_speed_kmh,
+                wind_gust_kmh = EXCLUDED.wind_gust_kmh,
+                condition = EXCLUDED.condition,
+                condition_code = EXCLUDED.condition_code,
+                precipitation_mm = EXCLUDED.precipitation_mm,
+                updated_at = CURRENT_TIMESTAMP
+              WHERE weather_data.is_manual_entry = false
+              RETURNING *`,
+              [
+                weatherData.date,
+                weatherData.temperature_high,
+                weatherData.temperature_low,
+                weatherData.temperature_avg,
+                weatherData.feels_like,
+                weatherData.humidity,
+                weatherData.wind_speed_kmh,
+                weatherData.wind_gust_kmh,
+                weatherData.condition,
+                weatherData.condition_code,
+                weatherData.precipitation_mm,
+                weatherData.location,
+                weatherData.is_manual_entry
+              ]
+            );
+
+            res.json(savedResult.rows[0] || weatherData);
+          } catch (saveErr) {
+            console.error('Error saving weather to database:', saveErr);
+            // Return the fetched data even if save fails
+            res.json(weatherData);
+          }
+        } else {
+          res.json(null);
+        }
       }
     } else {
       // Get recent weather data (last 30 days)
@@ -2727,34 +3028,54 @@ app.post('/api/weather', async (req, res) => {
   } = req.body;
 
   try {
-    // First ensure the weather_data table exists
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS weather_data (
-        id SERIAL PRIMARY KEY,
-        date DATE UNIQUE NOT NULL,
-        temperature_high REAL,
-        temperature_low REAL,
-        temperature_avg REAL,
-        feels_like REAL,
-        humidity INTEGER,
-        precipitation_mm REAL,
-        precipitation_type TEXT,
-        wind_speed_kmh REAL,
-        wind_gust_kmh REAL,
-        wind_direction TEXT,
-        pressure_mb REAL,
-        visibility_km REAL,
-        condition TEXT,
-        condition_code TEXT,
-        uv_index INTEGER,
-        sunrise TEXT,
-        sunset TEXT,
-        location TEXT DEFAULT 'Mississauga, Ontario',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        is_manual_entry BOOLEAN DEFAULT false
-      )
-    `);
+    // Try to check if required columns exist
+    let tableReady = false;
+    try {
+      const columnCheck = await pool.query(`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_name = 'weather_data'
+        AND column_name = 'temperature_high'
+      `);
+      tableReady = columnCheck.rows.length > 0;
+    } catch (e) {
+      // Table might not exist
+      tableReady = false;
+    }
+
+    if (!tableReady) {
+      // Drop table if it exists with wrong structure
+      await pool.query(`DROP TABLE IF EXISTS weather_data`);
+
+      // Create the table with correct structure
+      await pool.query(`
+        CREATE TABLE weather_data (
+          id SERIAL PRIMARY KEY,
+          date DATE UNIQUE NOT NULL,
+          temperature_high REAL,
+          temperature_low REAL,
+          temperature_avg REAL,
+          feels_like REAL,
+          humidity INTEGER,
+          precipitation_mm REAL,
+          precipitation_type TEXT,
+          wind_speed_kmh REAL,
+          wind_gust_kmh REAL,
+          wind_direction TEXT,
+          pressure_mb REAL,
+          visibility_km REAL,
+          condition TEXT,
+          condition_code TEXT,
+          uv_index INTEGER,
+          sunrise TEXT,
+          sunset TEXT,
+          location TEXT DEFAULT 'Mississauga, Ontario',
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          is_manual_entry BOOLEAN DEFAULT false
+        )
+      `);
+    }
 
     // Calculate temperature average
     const temperature_avg = (temperature_high + temperature_low) / 2;
@@ -2793,13 +3114,533 @@ app.post('/api/weather', async (req, res) => {
         condition,
         precipitation_mm,
         location || 'Mississauga, Ontario',
-        is_manual_entry || true
+        is_manual_entry !== undefined ? is_manual_entry : true
       ]
     );
 
     res.json(result.rows[0]);
   } catch (err) {
     console.error('Error saving weather:', err);
+    res.status(500).json({
+      error: err.message,
+      details: err.detail || 'No additional details available'
+    });
+  }
+});
+
+// Delete a worker
+app.delete('/api/workers/:id', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // Delete from users table
+    const result = await pool.query(
+      'DELETE FROM users WHERE id = $1 RETURNING *',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Worker not found' });
+    }
+
+    res.json({ success: true, deleted: result.rows[0] });
+  } catch (err) {
+    console.error('Error deleting worker:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get duplicate workers (same name)
+app.get('/api/workers/duplicates', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT u1.id, u1.name, u1.role, u1.created_at,
+             (SELECT signin_time FROM worker_signins
+              WHERE LOWER(worker_name) = LOWER(u1.name)
+              ORDER BY signin_time DESC LIMIT 1) as last_signin
+      FROM users u1
+      WHERE LOWER(u1.name) IN (
+        SELECT LOWER(name)
+        FROM users
+        GROUP BY LOWER(name)
+        HAVING COUNT(*) > 1
+      )
+      ORDER BY LOWER(u1.name), u1.created_at
+    `);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error finding duplicate workers:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get vacation status for workers
+app.get('/api/vacations', async (req, res) => {
+  const { date } = req.query;
+  const queryDate = date || getEasternDate();
+
+  try {
+    // First ensure the table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS vacation_schedule (
+        id SERIAL PRIMARY KEY,
+        worker_name VARCHAR(255) NOT NULL,
+        vacation_start DATE NOT NULL,
+        vacation_end DATE NOT NULL,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    const result = await pool.query(
+      `SELECT worker_name, vacation_start, vacation_end, notes
+       FROM vacation_schedule
+       WHERE $1 BETWEEN vacation_start AND vacation_end`,
+      [queryDate]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching vacations:', err);
+    res.json([]); // Return empty array instead of error
+  }
+});
+
+// Set vacation status for a worker
+app.post('/api/vacations', async (req, res) => {
+  const { worker_name, date, vacation_start, vacation_end, notes } = req.body;
+
+  // Support both single date and date range
+  const startDate = vacation_start || date;
+  const endDate = vacation_end || date;
+
+  try {
+    // Check if vacation schedule table exists, if not create it
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS vacation_schedule (
+        id SERIAL PRIMARY KEY,
+        worker_name VARCHAR(255) NOT NULL,
+        vacation_start DATE NOT NULL,
+        vacation_end DATE NOT NULL,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Insert vacation record
+    const result = await pool.query(
+      `INSERT INTO vacation_schedule (worker_name, vacation_start, vacation_end, notes)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [worker_name, startDate, endDate, notes || 'Marked as vacation']
+    );
+
+    res.json({ success: true, ...result.rows[0] });
+  } catch (err) {
+    console.error('Error setting vacation:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Mark attendance status (present/absent/vacation)
+app.post('/api/attendance/mark', async (req, res) => {
+  const { worker_name, date, status } = req.body;
+  const queryDate = date || getEasternDate();
+
+  try {
+    // Ensure attendance table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS attendance (
+        id SERIAL PRIMARY KEY,
+        worker_id INTEGER,
+        worker_name VARCHAR(255),
+        date DATE,
+        status VARCHAR(50),
+        check_in_time TIME,
+        check_out_time TIME,
+        sign_in_latitude DOUBLE PRECISION,
+        sign_in_longitude DOUBLE PRECISION,
+        sign_in_address TEXT,
+        sign_out_latitude DOUBLE PRECISION,
+        sign_out_longitude DOUBLE PRECISION,
+        sign_out_address TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Check if attendance record exists
+    const existing = await pool.query(
+      'SELECT * FROM attendance WHERE LOWER(worker_name) = LOWER($1) AND date = $2',
+      [worker_name, queryDate]
+    );
+
+    if (existing.rows.length === 0) {
+      // Create new attendance record
+      await pool.query(
+        `INSERT INTO attendance (worker_name, date, status)
+         VALUES ($1, $2, $3)`,
+        [worker_name, queryDate, status]
+      );
+    } else {
+      // Update existing record
+      await pool.query(
+        `UPDATE attendance SET status = $1
+         WHERE LOWER(worker_name) = LOWER($2) AND date = $3`,
+        [status, worker_name, queryDate]
+      );
+    }
+
+    // If marking as vacation, also create vacation schedule record
+    if (status === 'vacation') {
+      // Check if vacation schedule exists for today
+      const vacationExists = await pool.query(
+        `SELECT * FROM vacation_schedule
+         WHERE worker_name = $1 AND $2 BETWEEN vacation_start AND vacation_end`,
+        [worker_name, queryDate]
+      );
+
+      if (vacationExists.rows.length === 0) {
+        // Create single day vacation record
+        await pool.query(
+          `INSERT INTO vacation_schedule (worker_name, vacation_start, vacation_end, notes)
+           VALUES ($1, $2, $2, $3)
+           ON CONFLICT DO NOTHING`,
+          [worker_name, queryDate, queryDate, 'Single day vacation']
+        );
+      }
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error marking attendance:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Material Requests endpoints
+app.get('/api/material-requests', async (req, res) => {
+  const { status, urgency } = req.query;
+
+  try {
+    // Ensure material_requests table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS material_requests (
+        id SERIAL PRIMARY KEY,
+        worker_id INTEGER,
+        worker_name VARCHAR(255),
+        project_id INTEGER,
+        project_name VARCHAR(255),
+        items JSONB NOT NULL,
+        urgency VARCHAR(20),
+        delivery_date DATE,
+        notes TEXT,
+        status VARCHAR(50) DEFAULT 'pending',
+        submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP,
+        updated_by VARCHAR(255),
+        completion_notes TEXT
+      )
+    `);
+
+    let query = 'SELECT * FROM material_requests WHERE 1=1';
+    const params = [];
+    let paramIndex = 1;
+
+    if (status && status !== 'all') {
+      query += ` AND status = $${paramIndex++}`;
+      params.push(status);
+    }
+
+    if (urgency && urgency !== 'all') {
+      query += ` AND urgency = $${paramIndex++}`;
+      params.push(urgency);
+    }
+
+    query += ' ORDER BY submitted_at DESC';
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching material requests:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/material-requests', async (req, res) => {
+  const {
+    worker_id,
+    worker_name,
+    project_id,
+    project_name,
+    items,
+    urgency,
+    delivery_date,
+    notes
+  } = req.body;
+
+  try {
+    // Ensure table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS material_requests (
+        id SERIAL PRIMARY KEY,
+        worker_id INTEGER,
+        worker_name VARCHAR(255),
+        project_id INTEGER,
+        project_name VARCHAR(255),
+        items JSONB NOT NULL,
+        urgency VARCHAR(20),
+        delivery_date DATE,
+        notes TEXT,
+        status VARCHAR(50) DEFAULT 'pending',
+        submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP,
+        updated_by VARCHAR(255),
+        completion_notes TEXT
+      )
+    `);
+
+    const result = await pool.query(
+      `INSERT INTO material_requests
+       (worker_id, worker_name, project_id, project_name, items, urgency, delivery_date, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [worker_id, worker_name, project_id, project_name, JSON.stringify(items), urgency, delivery_date, notes]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error creating material request:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/material-requests/:id', async (req, res) => {
+  const { id } = req.params;
+  const { status, completion_notes, updated_by } = req.body;
+
+  try {
+    const result = await pool.query(
+      `UPDATE material_requests
+       SET status = COALESCE($1, status),
+           completion_notes = COALESCE($2, completion_notes),
+           updated_by = COALESCE($3, updated_by),
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $4
+       RETURNING *`,
+      [status, completion_notes, updated_by, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Material request not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error updating material request:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/material-requests/:id', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const result = await pool.query(
+      'DELETE FROM material_requests WHERE id = $1 RETURNING *',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Material request not found' });
+    }
+
+    res.json({ success: true, deleted: result.rows[0] });
+  } catch (err) {
+    console.error('Error deleting material request:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Worker Profile endpoints
+app.get('/api/workers/:workerId', async (req, res) => {
+  const { workerId } = req.params;
+  try {
+    // First ensure workers_info table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS workers_info (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        phone TEXT,
+        email TEXT,
+        address TEXT,
+        emergency_contact TEXT,
+        emergency_phone TEXT,
+        start_date DATE,
+        position TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `).catch(() => {});
+
+    // Get worker info - first try workers_info table, then workers table
+    let result = await pool.query('SELECT * FROM workers_info WHERE id = $1', [workerId]);
+
+    if (result.rows.length === 0) {
+      // Try workers table
+      const workerResult = await pool.query('SELECT * FROM workers WHERE id = $1', [workerId]);
+      if (workerResult.rows.length > 0) {
+        const worker = workerResult.rows[0];
+        // Create initial record in workers_info
+        await pool.query(
+          'INSERT INTO workers_info (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING',
+          [worker.id, worker.name]
+        );
+        result = await pool.query('SELECT * FROM workers_info WHERE id = $1', [workerId]);
+      }
+    }
+
+    // Get certifications
+    const certResult = await pool.query(
+      'SELECT * FROM worker_certifications WHERE worker_id = $1 ORDER BY issue_date DESC',
+      [workerId]
+    );
+
+    const workerData = result.rows[0] || {};
+    workerData.certifications = certResult.rows;
+
+    res.json(workerData);
+  } catch (err) {
+    console.error('Error fetching worker:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/workers/:workerId', async (req, res) => {
+  const { workerId } = req.params;
+  const { name, phone, email, address, emergency_contact, emergency_phone, start_date, position } = req.body;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO workers_info (id, name, phone, email, address, emergency_contact, emergency_phone, start_date, position)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (id) DO UPDATE SET
+         name = COALESCE($2, workers_info.name),
+         phone = COALESCE($3, workers_info.phone),
+         email = COALESCE($4, workers_info.email),
+         address = COALESCE($5, workers_info.address),
+         emergency_contact = COALESCE($6, workers_info.emergency_contact),
+         emergency_phone = COALESCE($7, workers_info.emergency_phone),
+         start_date = COALESCE($8, workers_info.start_date),
+         position = COALESCE($9, workers_info.position)
+       RETURNING *`,
+      [workerId, name, phone, email, address, emergency_contact, emergency_phone, start_date, position]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error updating worker:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/workers/:workerId/attendance', async (req, res) => {
+  const { workerId } = req.params;
+  const { start_date, end_date } = req.query;
+
+  try {
+    const result = await pool.query(
+      `SELECT date, status,
+        CASE
+          WHEN t.total_hours IS NOT NULL THEN t.total_hours
+          ELSE 0
+        END as hours_worked
+       FROM attendance a
+       LEFT JOIN timesheets t ON t.worker_id = a.worker_id AND t.date = a.date
+       WHERE a.worker_id = $1 AND a.date >= $2 AND a.date <= $3
+       ORDER BY a.date`,
+      [workerId, start_date, end_date]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching attendance:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/workers/:workerId/timesheet-summary', async (req, res) => {
+  const { workerId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `SELECT
+        week_number as week,
+        SUM(COALESCE(regular_hours, LEAST(total_hours, 8))) as regular_hours,
+        SUM(COALESCE(overtime_hours, GREATEST(total_hours - 8, 0))) as overtime_hours,
+        SUM(total_hours) as total_hours
+       FROM timesheets
+       WHERE worker_id = $1 AND date >= CURRENT_DATE - INTERVAL '12 weeks'
+       GROUP BY week_number
+       ORDER BY week_number DESC
+       LIMIT 12`,
+      [workerId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching timesheet summary:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Worker Certifications
+app.post('/api/workers/:workerId/certifications', async (req, res) => {
+  const { workerId } = req.params;
+  const { name, issuer, issue_date, expiry_date } = req.body;
+
+  try {
+    // Create table if not exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS worker_certifications (
+        id SERIAL PRIMARY KEY,
+        worker_id INTEGER,
+        name TEXT,
+        issuer TEXT,
+        issue_date DATE,
+        expiry_date DATE,
+        file_url TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `).catch(() => {});
+
+    const result = await pool.query(
+      `INSERT INTO worker_certifications (worker_id, name, issuer, issue_date, expiry_date)
+       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      [workerId, name, issuer, issue_date, expiry_date || null]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error adding certification:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/workers/:workerId/certifications/:certId', async (req, res) => {
+  const { workerId, certId } = req.params;
+
+  try {
+    await pool.query(
+      'DELETE FROM worker_certifications WHERE id = $1 AND worker_id = $2',
+      [certId, workerId]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error deleting certification:', err);
     res.status(500).json({ error: err.message });
   }
 });
