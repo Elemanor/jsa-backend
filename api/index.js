@@ -1114,6 +1114,28 @@ app.put('/api/concrete-deliveries/:id/complete', async (req, res) => {
       ADD COLUMN IF NOT EXISTS supervisor VARCHAR(255)
     `);
 
+    // Ensure concrete_pours table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS concrete_pours (
+        id SERIAL PRIMARY KEY,
+        project_name VARCHAR(255),
+        pour_date DATE,
+        area VARCHAR(255),
+        planned_volume DECIMAL(10,2),
+        actual_volume DECIMAL(10,2),
+        planned_start TIMESTAMP,
+        planned_end TIMESTAMP,
+        actual_start TIMESTAMP,
+        actual_end TIMESTAMP,
+        concrete_type VARCHAR(100),
+        supplier VARCHAR(255),
+        supervisor VARCHAR(255),
+        status VARCHAR(50),
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // Update the delivery with actual data
     const result = await pool.query(
       `UPDATE concrete_deliveries
@@ -1151,20 +1173,25 @@ app.put('/api/concrete-deliveries/:id/complete', async (req, res) => {
         );
       } else {
         // Create new pour record
+        const plannedTime = delivery.delivery_time
+          ? `${delivery.delivery_date} ${delivery.delivery_time}`
+          : `${delivery.delivery_date} 08:00:00`;
+
         await pool.query(
           `INSERT INTO concrete_pours
            (project_name, pour_date, area, planned_volume, actual_volume,
             planned_start, planned_end, actual_start, actual_end,
             concrete_type, supplier, supervisor, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $6, NOW(), NOW(), $7, 'Local Supplier', $8, 'completed')`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), $8, 'Local Supplier', $9, 'completed')`,
           [
             delivery.project_name,
             delivery.delivery_date,
             delivery.area,
-            delivery.quantity,
-            actual_volume,
-            delivery.delivery_time ? `${delivery.delivery_date} ${delivery.delivery_time}` : delivery.delivery_date,
-            delivery.concrete_type,
+            parseFloat(delivery.quantity) || 0,
+            parseFloat(actual_volume) || 0,
+            plannedTime,
+            plannedTime, // Using same time for start and end as placeholder
+            delivery.concrete_type || '30 MPA',
             supervisor
           ]
         );
