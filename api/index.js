@@ -3,6 +3,11 @@ const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const { generatePresignedUrl, uploadToS3 } = require('./s3-upload');
+const multer = require('multer');
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 } // 50MB limit
+});
 
 // Helper function to get EST/EDT date
 function getEasternDate() {
@@ -38,7 +43,8 @@ app.use(cors({
   preflightContinue: false,
   optionsSuccessStatus: 200
 }));
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -538,6 +544,189 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+// Worker registration with certificates
+app.post('/api/auth/register', upload.fields([
+  { name: 'workingAtHeightsCert', maxCount: 1 },
+  { name: 'whimisCert', maxCount: 1 },
+  { name: 'worker4StepCert', maxCount: 1 }
+]), async (req, res) => {
+  try {
+    const {
+      firstName,
+      lastName,
+      dateOfBirth,
+      address,
+      email,
+      phone,
+      emergencyContact,
+      emergencyPhone,
+      language,
+      role,
+      pin
+    } = req.body;
+
+    const fullName = `${firstName} ${lastName}`;
+    const registrationDate = new Date().toISOString();
+
+    console.log('New worker registration:', { fullName, language });
+
+    // Validate mandatory certificates
+    if (!req.files || !req.files.workingAtHeightsCert) {
+      return res.status(400).json({
+        error: 'Working at Heights certificate is required',
+        success: false
+      });
+    }
+
+    if (!req.files.whimisCert) {
+      return res.status(400).json({
+        error: 'WHMIS certificate is required',
+        success: false
+      });
+    }
+
+    // First, check if user already exists
+    const existingUser = await pool.query(
+      'SELECT id FROM users WHERE LOWER(name) = LOWER($1)',
+      [fullName]
+    );
+
+    if (existingUser.rows.length > 0) {
+      return res.status(400).json({
+        error: 'User with this name already exists',
+        success: false
+      });
+    }
+
+    // Upload certificates to S3 if provided
+    let certificateUrls = {};
+
+    if (req.files) {
+      const uploadPromises = [];
+
+      if (req.files.workingAtHeightsCert) {
+        uploadPromises.push(
+          uploadToS3(
+            req.files.workingAtHeightsCert[0].buffer,
+            req.files.workingAtHeightsCert[0].originalname,
+            req.files.workingAtHeightsCert[0].mimetype,
+            'certificates'
+          ).then(result => {
+            certificateUrls.workingAtHeights = result.fileUrl;
+          })
+        );
+      }
+
+      if (req.files.whimisCert) {
+        uploadPromises.push(
+          uploadToS3(
+            req.files.whimisCert[0].buffer,
+            req.files.whimisCert[0].originalname,
+            req.files.whimisCert[0].mimetype,
+            'certificates'
+          ).then(result => {
+            certificateUrls.whimis = result.fileUrl;
+          })
+        );
+      }
+
+      if (req.files.worker4StepCert) {
+        uploadPromises.push(
+          uploadToS3(
+            req.files.worker4StepCert[0].buffer,
+            req.files.worker4StepCert[0].originalname,
+            req.files.worker4StepCert[0].mimetype,
+            'certificates'
+          ).then(result => {
+            certificateUrls.worker4Step = result.fileUrl;
+          })
+        );
+      }
+
+      await Promise.all(uploadPromises);
+    }
+
+    // Create tables if they don't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS worker_details (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+        first_name VARCHAR(100),
+        last_name VARCHAR(100),
+        date_of_birth DATE,
+        address TEXT,
+        email VARCHAR(255),
+        phone VARCHAR(50),
+        emergency_contact VARCHAR(255),
+        emergency_phone VARCHAR(50),
+        language VARCHAR(10),
+        registration_date TIMESTAMP,
+        working_at_heights_cert TEXT,
+        whimis_cert TEXT,
+        worker_4step_cert TEXT,
+        UNIQUE(user_id)
+      )
+    `);
+
+    // Start transaction
+    await pool.query('BEGIN');
+
+    try {
+      // Insert into users table
+      const userResult = await pool.query(
+        'INSERT INTO users (name, pin, role) VALUES ($1, $2, $3) RETURNING id',
+        [fullName, pin, role || 'worker']
+      );
+
+      const userId = userResult.rows[0].id;
+
+      // Insert into worker_details table
+      await pool.query(`
+        INSERT INTO worker_details (
+          user_id, first_name, last_name, date_of_birth,
+          address, email, phone, emergency_contact, emergency_phone,
+          language, registration_date,
+          working_at_heights_cert, whimis_cert, worker_4step_cert
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+      `, [
+        userId, firstName, lastName, dateOfBirth,
+        address, email || null, phone, emergencyContact, emergencyPhone,
+        language, registrationDate,
+        certificateUrls.workingAtHeights || null,
+        certificateUrls.whimis || null,
+        certificateUrls.worker4Step || null
+      ]);
+
+      // Commit transaction
+      await pool.query('COMMIT');
+
+      console.log('Worker registered successfully:', fullName);
+
+      res.json({
+        success: true,
+        message: 'Registration successful',
+        user: {
+          id: userId,
+          name: fullName,
+          role: role || 'worker'
+        }
+      });
+
+    } catch (error) {
+      await pool.query('ROLLBACK');
+      throw error;
+    }
+
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({
+      error: 'Failed to register worker',
+      details: error.message,
+      success: false
+    });
+  }
+});
+
 // Worker sign-in
 app.post('/api/worker/signin', async (req, res) => {
   // Support both workerName and worker_name for backward compatibility
@@ -886,10 +1075,46 @@ app.post('/api/timesheets', async (req, res) => {
 // Get all workers
 app.get('/api/workers', async (req, res) => {
   try {
-    const result = await pool.query(
-      "SELECT id, name, role FROM users WHERE role = 'worker' ORDER BY name"
-    );
-    res.json(result.rows);
+    // Get all workers from users table with their details
+    const result = await pool.query(`
+      SELECT
+        u.id, u.name, u.role,
+        wd.first_name, wd.last_name, wd.date_of_birth,
+        wd.address, wd.email, wd.phone,
+        wd.emergency_contact, wd.emergency_phone,
+        wd.language, wd.registration_date,
+        wd.working_at_heights_cert,
+        wd.whimis_cert,
+        wd.worker_4step_cert
+      FROM users u
+      LEFT JOIN worker_details wd ON u.id = wd.user_id
+      WHERE u.role = 'worker'
+      ORDER BY u.name
+    `);
+
+    // Format the response
+    const workers = result.rows.map(worker => ({
+      id: worker.id,
+      name: worker.name,
+      role: worker.role,
+      firstName: worker.first_name,
+      lastName: worker.last_name,
+      dateOfBirth: worker.date_of_birth,
+      address: worker.address,
+      email: worker.email,
+      phone: worker.phone,
+      emergencyContact: worker.emergency_contact,
+      emergencyPhone: worker.emergency_phone,
+      language: worker.language,
+      registrationDate: worker.registration_date,
+      certificates: {
+        workingAtHeights: worker.working_at_heights_cert,
+        whimis: worker.whimis_cert,
+        worker4Step: worker.worker_4step_cert
+      }
+    }));
+
+    res.json(workers);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2207,7 +2432,96 @@ app.post('/api/auto-signout', async (req, res) => {
   }
 });
 
-// Get worker signin status
+// Get worker signin status (query parameter version)
+app.get('/api/worker/signin-status', async (req, res) => {
+  const { workerId, date } = req.query;
+  const targetDate = date || getEasternDate();
+
+  try {
+    // Get user name from ID
+    const userResult = await pool.query(
+      'SELECT name FROM users WHERE id = $1',
+      [workerId]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.json({ signed_in: false });
+    }
+
+    const workerName = userResult.rows[0].name;
+
+    // Check if worker is currently signed in
+    const result = await pool.query(
+      `SELECT *
+       FROM worker_signins
+       WHERE LOWER(worker_name) = LOWER($1)
+       AND signin_date = $2
+       AND signout_time IS NULL
+       ORDER BY signin_time DESC
+       LIMIT 1`,
+      [workerName, targetDate]
+    );
+
+    if (result.rows.length > 0) {
+      res.json({
+        signed_in: true,
+        signin_time: result.rows[0].signin_time,
+        project_name: result.rows[0].project_name,
+        site_address: result.rows[0].site_address
+      });
+    } else {
+      res.json({ signed_in: false });
+    }
+  } catch (err) {
+    console.error('Error checking signin status:', err);
+    res.json({ signed_in: false });
+  }
+});
+
+// Get timesheet data for a worker
+app.get('/api/worker/timesheet-data', async (req, res) => {
+  const { workerId, date } = req.query;
+  const targetDate = date || getEasternDate();
+
+  try {
+    // Get worker name from ID
+    const userResult = await pool.query(
+      'SELECT name FROM users WHERE id = $1',
+      [workerId]
+    );
+
+    if (userResult.rows.length === 0) {
+      return res.json({ signin_time: null, signout_time: null });
+    }
+
+    const workerName = userResult.rows[0].name;
+
+    // Get today's sign-in/out data
+    const result = await pool.query(
+      `SELECT signin_time, signout_time
+       FROM worker_signins
+       WHERE LOWER(worker_name) = LOWER($1)
+       AND signin_date = $2
+       ORDER BY signin_time DESC
+       LIMIT 1`,
+      [workerName, targetDate]
+    );
+
+    if (result.rows.length > 0) {
+      res.json({
+        signin_time: result.rows[0].signin_time,
+        signout_time: result.rows[0].signout_time
+      });
+    } else {
+      res.json({ signin_time: null, signout_time: null });
+    }
+  } catch (err) {
+    console.error('Error fetching timesheet data:', err);
+    res.status(500).json({ error: 'Failed to fetch timesheet data' });
+  }
+});
+
+// Get worker signin status (path parameter version - keep for compatibility)
 app.get('/api/worker/signin-status/:workerId', async (req, res) => {
   const { workerId } = req.params;
   const today = getEasternDate();
@@ -2895,6 +3209,18 @@ app.post('/api/work-areas/:areaId/assign-worker', async (req, res) => {
   const assignDate = date || getEasternDate();
 
   try {
+    // First ensure the table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS work_area_workers (
+        id SERIAL PRIMARY KEY,
+        work_area_id INTEGER NOT NULL,
+        worker_id INTEGER NOT NULL,
+        work_date DATE NOT NULL,
+        assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(work_area_id, worker_id, work_date)
+      )
+    `).catch(() => {});
+
     // Check if assignment already exists
     const existing = await pool.query(
       `SELECT id FROM work_area_workers
@@ -2903,7 +3229,7 @@ app.post('/api/work-areas/:areaId/assign-worker', async (req, res) => {
     );
 
     if (existing.rows.length > 0) {
-      return res.json({ message: 'Worker already assigned to this area for today' });
+      return res.json({ message: 'Worker already assigned to this area for today', success: true });
     }
 
     // Create assignment
@@ -2914,7 +3240,8 @@ app.post('/api/work-areas/:areaId/assign-worker', async (req, res) => {
       [areaId, workerId, assignDate]
     );
 
-    res.json(result.rows[0]);
+    console.log(`Assigned worker ${workerId} to work area ${areaId} for date ${assignDate}`);
+    res.json({ ...result.rows[0], success: true });
   } catch (err) {
     console.error('Error assigning worker to work area:', err);
     res.status(500).json({ error: err.message });
@@ -3766,6 +4093,93 @@ app.post('/api/weather', async (req, res) => {
   }
 });
 
+// Weather Events endpoints (for Construction Calendar)
+app.get('/api/weather-events', async (req, res) => {
+  try {
+    const { month, year } = req.query;
+
+    let query = 'SELECT * FROM weather_events';
+    const params = [];
+
+    if (month && year) {
+      query += ' WHERE EXTRACT(MONTH FROM date) = $1 AND EXTRACT(YEAR FROM date) = $2';
+      params.push(month, year);
+    }
+
+    query += ' ORDER BY date DESC';
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching weather events:', err);
+    res.json([]); // Return empty array if table doesn't exist
+  }
+});
+
+app.post('/api/weather-events', async (req, res) => {
+  try {
+    const {
+      date,
+      type,
+      start_time,
+      end_time,
+      hours_worked,
+      description,
+      affected_projects,
+      crew_count
+    } = req.body;
+
+    // Create table if doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS weather_events (
+        id SERIAL PRIMARY KEY,
+        date DATE NOT NULL,
+        type VARCHAR(50) NOT NULL,
+        start_time VARCHAR(10),
+        end_time VARCHAR(10),
+        hours_worked DECIMAL(4,2),
+        description TEXT,
+        affected_projects JSONB,
+        crew_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(date)
+      )
+    `);
+
+    const result = await pool.query(`
+      INSERT INTO weather_events (
+        date, type, start_time, end_time, hours_worked,
+        description, affected_projects, crew_count
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (date) DO UPDATE SET
+        type = EXCLUDED.type,
+        start_time = EXCLUDED.start_time,
+        end_time = EXCLUDED.end_time,
+        hours_worked = EXCLUDED.hours_worked,
+        description = EXCLUDED.description,
+        affected_projects = EXCLUDED.affected_projects,
+        crew_count = EXCLUDED.crew_count,
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING *
+    `, [
+      date,
+      type,
+      start_time,
+      end_time,
+      hours_worked,
+      description,
+      JSON.stringify(affected_projects),
+      crew_count
+    ]);
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error saving weather event:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Delete a worker
 app.delete('/api/workers/:id', async (req, res) => {
   const { id } = req.params;
@@ -4168,6 +4582,12 @@ app.delete('/api/material-requests/:id', async (req, res) => {
 // Worker Profile endpoints
 app.get('/api/workers/:workerId', async (req, res) => {
   const { workerId } = req.params;
+
+  // Validate workerId
+  if (!workerId || isNaN(parseInt(workerId))) {
+    return res.status(400).json({ error: 'Invalid worker ID' });
+  }
+
   try {
     // First ensure workers_info table exists
     await pool.query(`
@@ -4185,36 +4605,75 @@ app.get('/api/workers/:workerId', async (req, res) => {
       )
     `).catch(() => {});
 
-    // Get worker info - first try workers_info table, then workers table
-    let result = await pool.query('SELECT * FROM workers_info WHERE id = $1', [workerId]);
+    // Get worker basic info from users table
+    const userResult = await pool.query('SELECT * FROM users WHERE id = $1', [workerId]);
 
-    if (result.rows.length === 0) {
-      // Try workers table
-      const workerResult = await pool.query('SELECT * FROM workers WHERE id = $1', [workerId]);
-      if (workerResult.rows.length > 0) {
-        const worker = workerResult.rows[0];
-        // Create initial record in workers_info
-        await pool.query(
-          'INSERT INTO workers_info (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING',
-          [worker.id, worker.name]
-        );
-        result = await pool.query('SELECT * FROM workers_info WHERE id = $1', [workerId]);
-      }
+    if (userResult.rows.length === 0) {
+      console.log(`Worker not found with ID: ${workerId}`);
+      return res.status(404).json({ error: 'Worker not found' });
     }
 
-    // Get certifications
-    const certResult = await pool.query(
-      'SELECT * FROM worker_certifications WHERE worker_id = $1 ORDER BY issue_date DESC',
-      [workerId]
-    );
+    const user = userResult.rows[0];
 
-    const workerData = result.rows[0] || {};
-    workerData.certifications = certResult.rows;
+    // Get worker details from worker_details table (may not exist for all workers)
+    let detailsResult = { rows: [] };
+    try {
+      detailsResult = await pool.query(
+        'SELECT * FROM worker_details WHERE user_id = $1',
+        [workerId]
+      );
+    } catch (detailsErr) {
+      console.log(`No worker_details found for worker ${workerId}:`, detailsErr.message);
+    }
+
+    // Get worker info from workers_info table (may not exist for all workers)
+    let infoResult = { rows: [] };
+    try {
+      infoResult = await pool.query('SELECT * FROM workers_info WHERE id = $1', [workerId]);
+    } catch (infoErr) {
+      console.log(`No workers_info found for worker ${workerId}:`, infoErr.message);
+    }
+
+    // Get certifications from worker_certifications (may not exist for all workers)
+    let certResult = { rows: [] };
+    try {
+      certResult = await pool.query(
+        'SELECT * FROM worker_certifications WHERE worker_id = $1 ORDER BY issue_date DESC',
+        [workerId]
+      );
+    } catch (certErr) {
+      console.log(`No certifications found for worker ${workerId}:`, certErr.message);
+    }
+
+    // Combine all data - handle potential null/undefined values
+    const workerData = {
+      id: user.id,
+      name: user.name,
+      role: user.role,
+      phone: infoResult.rows[0]?.phone || detailsResult.rows[0]?.phone || user.phone || null,
+      email: infoResult.rows[0]?.email || detailsResult.rows[0]?.email || user.email || null,
+      address: infoResult.rows[0]?.address || detailsResult.rows[0]?.address || null,
+      emergencyContact: infoResult.rows[0]?.emergency_contact || detailsResult.rows[0]?.emergency_contact || null,
+      emergencyPhone: infoResult.rows[0]?.emergency_phone || detailsResult.rows[0]?.emergency_phone || null,
+      position: infoResult.rows[0]?.position || user.position || 'Worker',
+      dateOfBirth: detailsResult.rows[0]?.date_of_birth || null,
+      language: detailsResult.rows[0]?.language || 'en',
+      registrationDate: detailsResult.rows[0]?.created_at || user.created_at || null,
+      certifications: certResult.rows,
+      certificates: {
+        workingAtHeights: detailsResult.rows[0]?.working_at_heights_cert || null,
+        whimis: detailsResult.rows[0]?.whimis_cert || null,
+        worker4Step: detailsResult.rows[0]?.worker_4step_cert || null
+      }
+    };
 
     res.json(workerData);
   } catch (err) {
     console.error('Error fetching worker:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error: 'Failed to fetch worker data',
+      details: err.message
+    });
   }
 });
 
@@ -4251,20 +4710,59 @@ app.get('/api/workers/:workerId/attendance', async (req, res) => {
   const { start_date, end_date } = req.query;
 
   try {
-    const result = await pool.query(
-      `SELECT date, status,
-        CASE
-          WHEN t.total_hours IS NOT NULL THEN t.total_hours
-          ELSE 0
-        END as hours_worked
-       FROM attendance a
-       LEFT JOIN timesheets t ON t.worker_id = a.worker_id AND t.date = a.date
-       WHERE a.worker_id = $1 AND a.date >= $2 AND a.date <= $3
-       ORDER BY a.date`,
-      [workerId, start_date, end_date]
+    // Get worker name from ID
+    const workerResult = await pool.query(
+      'SELECT name FROM users WHERE id = $1',
+      [workerId]
     );
 
-    res.json(result.rows);
+    if (workerResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Worker not found' });
+    }
+
+    const workerName = workerResult.rows[0].name;
+
+    // Get attendance based on worker sign-ins
+    const result = await pool.query(
+      `SELECT
+        ws.signin_date as date,
+        CASE
+          WHEN ws.signout_time IS NOT NULL THEN 'present'
+          WHEN ws.signin_time IS NOT NULL THEN 'present'
+          ELSE 'absent'
+        END as status,
+        CASE
+          WHEN ws.signin_time IS NOT NULL AND ws.signout_time IS NOT NULL THEN
+            EXTRACT(EPOCH FROM (ws.signout_time - ws.signin_time))/3600
+          WHEN ws.signin_time IS NOT NULL THEN
+            -- If signed in but not signed out, assume they're still working or worked 9.5 hours
+            CASE
+              WHEN ws.signin_date = CURRENT_DATE THEN
+                EXTRACT(EPOCH FROM (NOW() - ws.signin_time))/3600
+              ELSE 9.5 -- Default to 9.5 hours if sign-out missing from previous day
+            END
+          ELSE 0
+        END as hours_worked
+       FROM worker_signins ws
+       WHERE LOWER(ws.worker_name) = LOWER($1)
+       AND ws.signin_date >= $2
+       AND ws.signin_date <= $3
+       ORDER BY ws.signin_date`,
+      [workerName, start_date, end_date]
+    );
+
+    // Also check if worker signed in before 6:15 AM and signed out after 4:00 PM for 9.5 hours
+    const attendanceWithProperHours = result.rows.map(row => {
+      if (row.status === 'present' && row.hours_worked > 0) {
+        // If worked more than 9 hours, cap at 9.5 for standard day
+        if (row.hours_worked >= 9) {
+          row.hours_worked = 9.5;
+        }
+      }
+      return row;
+    });
+
+    res.json(attendanceWithProperHours);
   } catch (err) {
     console.error('Error fetching attendance:', err);
     res.status(500).json({ error: err.message });
@@ -4275,21 +4773,48 @@ app.get('/api/workers/:workerId/timesheet-summary', async (req, res) => {
   const { workerId } = req.params;
 
   try {
-    const result = await pool.query(
-      `SELECT
-        week_number as week,
-        SUM(COALESCE(regular_hours, LEAST(total_hours, 8))) as regular_hours,
-        SUM(COALESCE(overtime_hours, GREATEST(total_hours - 8, 0))) as overtime_hours,
-        SUM(total_hours) as total_hours
-       FROM timesheets
-       WHERE worker_id = $1 AND date >= CURRENT_DATE - INTERVAL '12 weeks'
-       GROUP BY week_number
-       ORDER BY week_number DESC
-       LIMIT 12`,
+    // Get worker name from ID
+    const workerResult = await pool.query(
+      'SELECT name FROM users WHERE id = $1',
       [workerId]
     );
 
-    res.json(result.rows);
+    if (workerResult.rows.length === 0) {
+      return res.json([{ week: 0, regular_hours: 0, overtime_hours: 0, total_hours: 0 }]);
+    }
+
+    const workerName = workerResult.rows[0].name;
+
+    // Calculate weekly hours from worker_signins
+    const result = await pool.query(
+      `SELECT
+        EXTRACT(WEEK FROM signin_date) as week,
+        SUM(
+          CASE
+            WHEN signin_time IS NOT NULL AND signout_time IS NOT NULL THEN
+              LEAST(EXTRACT(EPOCH FROM (signout_time - signin_time))/3600, 9.5)
+            WHEN signin_time IS NOT NULL THEN 9.5 -- Default to 9.5 hours if no sign-out
+            ELSE 0
+          END
+        ) as total_hours
+       FROM worker_signins
+       WHERE LOWER(worker_name) = LOWER($1)
+       AND signin_date >= CURRENT_DATE - INTERVAL '12 weeks'
+       GROUP BY EXTRACT(WEEK FROM signin_date)
+       ORDER BY week DESC
+       LIMIT 12`,
+      [workerName]
+    );
+
+    // Format the response to include regular and overtime hours
+    const formattedResult = result.rows.map(row => ({
+      week: parseInt(row.week),
+      regular_hours: Math.min(parseFloat(row.total_hours) || 0, 40),
+      overtime_hours: Math.max(parseFloat(row.total_hours) - 40 || 0, 0),
+      total_hours: parseFloat(row.total_hours) || 0
+    }));
+
+    res.json(formattedResult);
   } catch (err) {
     console.error('Error fetching timesheet summary:', err);
     res.status(500).json({ error: err.message });
@@ -4722,20 +5247,53 @@ app.post('/api/workers/:workerId/certifications', async (req, res) => {
   const { workerId } = req.params;
   const { name, issuer, issue_date, expiry_date } = req.body;
 
+  // Validate workerId
+  if (!workerId || isNaN(parseInt(workerId))) {
+    return res.status(400).json({ error: 'Invalid worker ID' });
+  }
+
+  // Validate required fields
+  if (!name || !issuer || !issue_date) {
+    return res.status(400).json({
+      error: 'Missing required fields',
+      details: 'name, issuer, and issue_date are required'
+    });
+  }
+
   try {
     // Create table if not exists
     await pool.query(`
       CREATE TABLE IF NOT EXISTS worker_certifications (
         id SERIAL PRIMARY KEY,
-        worker_id INTEGER,
-        name TEXT,
-        issuer TEXT,
-        issue_date DATE,
+        worker_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        issuer TEXT NOT NULL,
+        issue_date DATE NOT NULL,
         expiry_date DATE,
         file_url TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
-    `).catch(() => {});
+    `).catch((err) => {
+      console.log('Table worker_certifications might already exist:', err.message);
+    });
+
+    // Validate dates
+    const issueDateObj = new Date(issue_date);
+    const expiryDateObj = expiry_date ? new Date(expiry_date) : null;
+
+    if (isNaN(issueDateObj.getTime())) {
+      return res.status(400).json({ error: 'Invalid issue date format' });
+    }
+
+    if (expiryDateObj && isNaN(expiryDateObj.getTime())) {
+      return res.status(400).json({ error: 'Invalid expiry date format' });
+    }
+
+    // Check if worker exists
+    const workerCheck = await pool.query('SELECT id FROM users WHERE id = $1', [workerId]);
+    if (workerCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Worker not found' });
+    }
 
     const result = await pool.query(
       `INSERT INTO worker_certifications (worker_id, name, issuer, issue_date, expiry_date)
@@ -4743,10 +5301,14 @@ app.post('/api/workers/:workerId/certifications', async (req, res) => {
       [workerId, name, issuer, issue_date, expiry_date || null]
     );
 
+    console.log(`Added certification for worker ${workerId}: ${name}`);
     res.json(result.rows[0]);
   } catch (err) {
     console.error('Error adding certification:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error: 'Failed to add certification',
+      details: err.message
+    });
   }
 });
 
