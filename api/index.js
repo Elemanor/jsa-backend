@@ -45,6 +45,28 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Update Romeu Morim to foreman
+app.get('/api/update-romeu-foreman', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "UPDATE users SET role = 'foreman' WHERE LOWER(name) = LOWER('Romeu Morim') RETURNING *"
+    );
+
+    if (result.rows.length > 0) {
+      res.json({ message: 'Romeu Morim updated to foreman', user: result.rows[0] });
+    } else {
+      // If not exists, create as foreman
+      await pool.query(
+        "INSERT INTO users (name, role, pin) VALUES ($1, $2, $3)",
+        ['Romeu Morim', 'foreman', '1234']
+      );
+      res.json({ message: 'Romeu Morim added as foreman' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Add Gustavo Mendez to workers if not exists
 app.get('/api/workers/init-gustavo', async (req, res) => {
   try {
@@ -113,6 +135,69 @@ app.get('/api/workers/init-mota', async (req, res) => {
         ['1111']
       );
       res.json({ message: 'Mota Marques PIN updated' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Add Alvaro Aleman to workers if not exists
+app.get('/api/workers/init-alvaro', async (req, res) => {
+  try {
+    // Check if Alvaro Aleman already exists
+    const check = await pool.query(
+      "SELECT id FROM users WHERE LOWER(name) = LOWER('Alvaro Aleman')"
+    );
+
+    if (check.rows.length === 0) {
+      // Add Alvaro Aleman with PIN
+      await pool.query(
+        "INSERT INTO users (name, role, pin) VALUES ($1, $2, $3)",
+        ['Alvaro Aleman', 'worker', '1111']
+      );
+      res.json({ message: 'Alvaro Aleman added successfully' });
+    } else {
+      // Update PIN for existing Alvaro Aleman
+      await pool.query(
+        "UPDATE users SET pin = $1 WHERE LOWER(name) = LOWER('Alvaro Aleman')",
+        ['1111']
+      );
+      res.json({ message: 'Alvaro Aleman PIN updated' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Force set Romeu Morim PIN
+app.get('/api/workers/set-romeu-pin', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "UPDATE users SET pin = '2024' WHERE id = 14 OR LOWER(name) = LOWER('Romeu Morim')"
+    );
+    res.json({ message: `Updated ${result.rowCount} records. Romeu Morim PIN is now 2024` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update Romeu Morim to foreman
+app.get('/api/workers/update-romeu-foreman', async (req, res) => {
+  try {
+    // Update Romeu Morim's role to foreman and set PIN to 2024
+    const result = await pool.query(
+      "UPDATE users SET role = 'foreman', pin = '2024' WHERE LOWER(name) = LOWER('Romeu Morim')"
+    );
+
+    if (result.rowCount > 0) {
+      res.json({ message: 'Romeu Morim updated to foreman with PIN 2024 successfully' });
+    } else {
+      // If not exists, create as foreman
+      await pool.query(
+        "INSERT INTO users (name, role, pin) VALUES ($1, $2, $3)",
+        ['Romeu Morim', 'foreman', '2024']
+      );
+      res.json({ message: 'Romeu Morim added as foreman with PIN 2024 successfully' });
     }
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -2803,6 +2888,64 @@ app.get('/api/workers/signed-in', async (req, res) => {
   }
 });
 
+// Assign worker to work area
+app.post('/api/work-areas/:areaId/assign-worker', async (req, res) => {
+  const { areaId } = req.params;
+  const { workerId, date } = req.body;
+  const assignDate = date || getEasternDate();
+
+  try {
+    // Check if assignment already exists
+    const existing = await pool.query(
+      `SELECT id FROM work_area_workers
+       WHERE work_area_id = $1 AND worker_id = $2 AND work_date = $3`,
+      [areaId, workerId, assignDate]
+    );
+
+    if (existing.rows.length > 0) {
+      return res.json({ message: 'Worker already assigned to this area for today' });
+    }
+
+    // Create assignment
+    const result = await pool.query(
+      `INSERT INTO work_area_workers (work_area_id, worker_id, work_date, assigned_at)
+       VALUES ($1, $2, $3, NOW())
+       RETURNING *`,
+      [areaId, workerId, assignDate]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error assigning worker to work area:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get workers assigned to a work area
+app.get('/api/work-areas/:areaId/workers', async (req, res) => {
+  const { areaId } = req.params;
+  const { date } = req.query;
+  const workDate = date || getEasternDate();
+
+  try {
+    const result = await pool.query(
+      `SELECT u.id, u.name, u.role, waw.assigned_at, ws.signin_time as "signInTime"
+       FROM work_area_workers waw
+       JOIN users u ON waw.worker_id = u.id
+       LEFT JOIN worker_signins ws ON u.name = ws.worker_name
+         AND ws.signin_date = waw.work_date
+       WHERE waw.work_area_id = $1 AND waw.work_date = $2
+       ORDER BY u.name`,
+      [areaId, workDate]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching work area workers:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Get workers signed into a specific project
 app.get('/api/projects/:projectId/signed-in-workers', async (req, res) => {
   const { projectId } = req.params;
@@ -2827,6 +2970,353 @@ app.get('/api/projects/:projectId/signed-in-workers', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching project signed-in workers:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get work areas assigned to a foreman (MOCK DATA for Romeu)
+app.get('/api/foreman/work-areas/:foremanId', async (req, res) => {
+  const { foremanId } = req.params;
+
+  // Mock data for Romeu Morim (ID: 14)
+  if (foremanId === '14') {
+    const mockWorkAreas = [
+      {
+        id: 'pc3-rs-03',
+        name: 'PC3-RS-03',
+        description: 'Primary Clarifiers - Train 3',
+        location: 'Wastewater Treatment Plant - North Section',
+        status: 'active',
+        current_stage: 'formwork',
+        start_date: new Date().toISOString(),
+        end_date: null,
+        foreman_assigned_date: new Date().toISOString(),
+        workers_today: 12,
+        total_documents: 8,
+        open_rfis: 2,
+        pending_instructions: 1,
+        pending_change_orders: 0,
+        today_concrete_volume: 125.5,
+        today_photos: 3
+      }
+    ];
+
+    res.json(mockWorkAreas);
+  } else {
+    res.json([]);
+  }
+});
+
+// Get work area details with documents, RFIs, etc. (MOCK DATA)
+app.get('/api/work-areas/:areaId/details', async (req, res) => {
+  const { areaId } = req.params;
+
+  // Mock data for PC3-RS-03
+  if (areaId === 'pc3-rs-03') {
+    const mockDetails = {
+      area: {
+        id: 'pc3-rs-03',
+        name: 'PC3-RS-03',
+        description: 'Primary Clarifiers - Train 3',
+        location: 'Wastewater Treatment Plant - North Section',
+        status: 'active',
+        current_stage: 'formwork'
+      },
+      documents: [
+        {
+          id: 1,
+          document_type: 'layout_submission',
+          name: 'PC3-Foundation-Layout-Rev2.pdf',
+          uploaded_by_name: 'John Smith',
+          uploaded_at: new Date('2025-01-18').toISOString()
+        },
+        {
+          id: 2,
+          document_type: 'work_order_change',
+          name: 'WOC-PC3-001-Rebar-Change.pdf',
+          uploaded_by_name: 'Project Manager',
+          uploaded_at: new Date('2025-01-17').toISOString()
+        }
+      ],
+      rfis: [
+        {
+          id: 1,
+          rfi_number: 'RFI-PC3-001',
+          title: 'Rebar Spacing Clarification',
+          description: 'Need clarification on rebar spacing for clarifier wall section 3B',
+          status: 'open',
+          priority: 'high',
+          submitted_by_name: 'Romeu Morim',
+          submitted_date: new Date('2025-01-19').toISOString(),
+          response_needed_by: new Date('2025-01-21').toISOString()
+        },
+        {
+          id: 2,
+          rfi_number: 'RFI-PC3-002',
+          title: 'Waterstop Detail at Construction Joint',
+          description: 'Please confirm waterstop type and installation method at CJ-3',
+          status: 'open',
+          priority: 'normal',
+          submitted_by_name: 'Site Engineer',
+          submitted_date: new Date('2025-01-18').toISOString()
+        }
+      ],
+      siteInstructions: [
+        {
+          id: 1,
+          instruction_number: 'SI-PC3-001',
+          title: 'Concrete Pour Sequence',
+          description: 'Follow the attached pour sequence for clarifier base slab. Pour in 3 sections as marked.',
+          instruction_type: 'method',
+          issued_by: 'Project Engineer',
+          issued_date: new Date('2025-01-19').toISOString(),
+          acknowledgement_required: true,
+          acknowledged_date: null
+        }
+      ],
+      changeOrders: [],
+      todayConcretePour: {
+        expected_volume_m3: 125.5,
+        concrete_type: '35MPa',
+        supplier: 'Ready Mix Concrete Co.',
+        start_time: '08:00',
+        notes: 'Foundation pour for clarifier base slab - Section A'
+      },
+      todayWorkers: [
+        { id: 1, worker_name: 'Mike Johnson', role: 'Concrete Foreman', check_in_time: '06:30', hours_worked: 4 },
+        { id: 2, worker_name: 'Carlos Rodriguez', role: 'Rebar Installer', check_in_time: '06:45', hours_worked: 3.5 },
+        { id: 3, worker_name: 'Tom Wilson', role: 'Formwork Carpenter', check_in_time: '07:00', hours_worked: 3 },
+        { id: 4, worker_name: 'David Chen', role: 'Concrete Finisher', check_in_time: '07:00', hours_worked: 3 },
+        { id: 5, worker_name: 'James Brown', role: 'Equipment Operator', check_in_time: '06:30', hours_worked: 4 }
+      ],
+      recentPhotos: [
+        {
+          id: 1,
+          photo_url: '/placeholder-photo-1.jpg',
+          thumbnail_url: '/placeholder-photo-1-thumb.jpg',
+          caption: 'Rebar installation progress - North wall',
+          taken_at: new Date('2025-01-19T10:30:00').toISOString()
+        },
+        {
+          id: 2,
+          photo_url: '/placeholder-photo-2.jpg',
+          thumbnail_url: '/placeholder-photo-2-thumb.jpg',
+          caption: 'Formwork setup complete - Section A',
+          taken_at: new Date('2025-01-19T09:15:00').toISOString()
+        }
+      ]
+    };
+
+    res.json(mockDetails);
+  } else {
+    res.status(404).json({ error: 'Work area not found' });
+  }
+});
+
+// Upload document to work area
+app.post('/api/work-areas/:areaId/documents', async (req, res) => {
+  const { areaId } = req.params;
+  const { document_type, name, file_url, file_size, file_type, uploaded_by, uploaded_by_name, description } = req.body;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO area_documents
+       (work_area_id, document_type, name, file_url, file_size, file_type, uploaded_by, uploaded_by_name, description)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [areaId, document_type, name, file_url, file_size, file_type, uploaded_by, uploaded_by_name, description]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error uploading document:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create or update concrete pour info
+app.post('/api/work-areas/:areaId/concrete-pour', async (req, res) => {
+  const { areaId } = req.params;
+  const { pour_date, expected_volume_m3, concrete_type, supplier, notes, created_by } = req.body;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO work_area_concrete_pours
+       (work_area_id, pour_date, expected_volume_m3, concrete_type, supplier, notes, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (work_area_id, pour_date)
+       DO UPDATE SET
+         expected_volume_m3 = $3,
+         concrete_type = $4,
+         supplier = $5,
+         notes = $6,
+         updated_at = NOW()
+       RETURNING *`,
+      [areaId, pour_date, expected_volume_m3, concrete_type, supplier, notes, created_by]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error saving concrete pour info:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get today's attendance for a work area
+app.get('/api/work-areas/:areaId/attendance/today', async (req, res) => {
+  const { areaId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `SELECT awa.*, u.name as worker_full_name, u.role as worker_role
+       FROM area_worker_assignments awa
+       LEFT JOIN users u ON awa.worker_id = u.id
+       WHERE awa.work_area_id = $1 AND awa.assignment_date = CURRENT_DATE
+       ORDER BY awa.check_in_time`,
+      [areaId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching attendance:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Setup initial work area for Romeu
+app.get('/api/setup-romeu-work-area', async (req, res) => {
+  try {
+    // Check if work area already exists
+    let areaResult = await pool.query(
+      `SELECT * FROM work_areas WHERE name = 'PC3-RS-03'`
+    );
+
+    if (areaResult.rows.length === 0) {
+      // Create new work area
+      areaResult = await pool.query(
+        `INSERT INTO work_areas (
+          name,
+          description,
+          location,
+          status,
+          current_stage,
+          start_date,
+          created_by
+        ) VALUES (
+          'PC3-RS-03',
+          'Primary Clarifiers - Train 3',
+          'Wastewater Treatment Plant - North Section',
+          'active',
+          'initial_layout',
+          CURRENT_DATE,
+          14
+        ) RETURNING *`
+      );
+    }
+
+    const workAreaId = areaResult.rows[0].id;
+
+    // Then assign Romeu as the foreman
+    const assignmentResult = await pool.query(
+      `INSERT INTO work_area_foreman_assignments (
+        work_area_id,
+        foreman_id,
+        foreman_name,
+        assigned_date,
+        is_active,
+        assigned_by,
+        notes
+      ) VALUES (
+        $1,
+        14,
+        'Romeu Morim',
+        CURRENT_DATE,
+        true,
+        1,
+        'Initial assignment to Primary Clarifiers - Train 3'
+      ) RETURNING *`,
+      [workAreaId]
+    );
+
+    // Add some sample concrete pour data for today
+    await pool.query(
+      `INSERT INTO work_area_concrete_pours (
+        work_area_id,
+        pour_date,
+        expected_volume_m3,
+        concrete_type,
+        supplier,
+        notes,
+        created_by
+      ) VALUES (
+        $1,
+        CURRENT_DATE,
+        125.5,
+        '35MPa',
+        'Ready Mix Concrete Co.',
+        'Foundation pour for clarifier base slab',
+        14
+      )`,
+      [workAreaId]
+    );
+
+    // Add sample RFI
+    await pool.query(
+      `INSERT INTO work_area_rfis (
+        work_area_id,
+        rfi_number,
+        title,
+        description,
+        status,
+        priority,
+        submitted_by,
+        submitted_by_name,
+        submitted_date
+      ) VALUES (
+        $1,
+        'RFI-PC3-001',
+        'Rebar Spacing Clarification',
+        'Need clarification on rebar spacing for clarifier wall section 3B',
+        'open',
+        'high',
+        14,
+        'Romeu Morim',
+        CURRENT_DATE
+      )`,
+      [workAreaId]
+    );
+
+    // Add sample site instruction
+    await pool.query(
+      `INSERT INTO work_area_site_instructions (
+        work_area_id,
+        instruction_number,
+        title,
+        description,
+        instruction_type,
+        issued_by,
+        issued_date,
+        acknowledgement_required
+      ) VALUES (
+        $1,
+        'SI-PC3-001',
+        'Concrete Pour Sequence',
+        'Follow the attached pour sequence for clarifier base slab. Pour in 3 sections as marked.',
+        'method',
+        'Project Engineer',
+        CURRENT_DATE,
+        true
+      )`,
+      [workAreaId]
+    );
+
+    res.json({
+      message: 'Work area PC3-RS-03 created and assigned to Romeu Morim',
+      workArea: areaResult.rows[0],
+      assignment: assignmentResult.rows[0]
+    });
+  } catch (err) {
+    console.error('Error setting up work area:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -3946,6 +4436,288 @@ app.delete('/api/concrete-pours/:id', async (req, res) => {
 });
 
 // Worker Certifications
+// ====================
+// Foreman Location Management Endpoints
+// ====================
+
+// Get locations for a foreman
+app.get('/api/foreman/locations/:foremanId', async (req, res) => {
+  const { foremanId } = req.params;
+
+  try {
+    // Get all projects and their current status
+    const result = await pool.query(`
+      SELECT
+        p.id,
+        p.name,
+        p.address,
+        p.id as project_id,
+        p.name as project_name,
+        true as active,
+        COUNT(DISTINCT ws.worker_name) as workers_present,
+        p.created_at
+      FROM projects p
+      LEFT JOIN worker_signins ws ON p.id = ws.project_id
+        AND DATE(ws.signin_date) = CURRENT_DATE
+        AND ws.signout_time IS NULL
+      GROUP BY p.id, p.name, p.address, p.created_at
+      ORDER BY p.name
+    `);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching locations:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get worker locations for today
+app.get('/api/foreman/worker-locations', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        ws.worker_name,
+        u.id as worker_id,
+        ws.signin_time as check_in_time,
+        ws.signout_time as check_out_time,
+        p.name as location,
+        p.address as address,
+        CASE
+          WHEN ws.signout_time IS NULL THEN 'present'
+          ELSE 'checked_out'
+        END as status
+      FROM worker_signins ws
+      JOIN projects p ON ws.project_id = p.id
+      LEFT JOIN users u ON LOWER(u.name) = LOWER(ws.worker_name)
+      WHERE DATE(ws.signin_date) = CURRENT_DATE
+      ORDER BY ws.signin_time DESC
+    `);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching worker locations:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get attendance data with location info
+app.get('/api/foreman/attendance-locations', async (req, res) => {
+  const { date } = req.query;
+  const targetDate = date || new Date().toISOString().split('T')[0];
+
+  try {
+    const result = await pool.query(`
+      SELECT
+        a.worker_name,
+        a.check_in_time,
+        a.check_out_time,
+        a.sign_in_latitude,
+        a.sign_in_longitude,
+        a.sign_in_address,
+        a.sign_out_latitude,
+        a.sign_out_longitude,
+        a.sign_out_address,
+        a.status
+      FROM attendance a
+      WHERE DATE(a.date) = $1
+      ORDER BY a.check_in_time DESC
+    `, [targetDate]);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching attendance locations:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ====================
+// Safety Certificates Endpoints
+// ====================
+
+// Create safety certificates table if not exists
+app.get('/api/safety-certificates/init', async (req, res) => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS safety_certificates (
+        id SERIAL PRIMARY KEY,
+        worker_id INTEGER,
+        worker_name TEXT NOT NULL,
+        certificate_type TEXT NOT NULL,
+        certificate_name TEXT NOT NULL,
+        issuing_organization TEXT,
+        issue_date DATE NOT NULL,
+        expiry_date DATE NOT NULL,
+        certificate_number TEXT,
+        file_url TEXT,
+        status TEXT DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create indexes
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_safety_certificates_worker_id ON safety_certificates(worker_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_safety_certificates_expiry_date ON safety_certificates(expiry_date)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_safety_certificates_status ON safety_certificates(status)`);
+
+    res.json({ message: 'Safety certificates table initialized' });
+  } catch (err) {
+    console.error('Error initializing safety certificates table:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get certificates for a worker
+app.get('/api/safety-certificates/worker/:workerId', async (req, res) => {
+  const { workerId } = req.params;
+
+  try {
+    // First ensure table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS safety_certificates (
+        id SERIAL PRIMARY KEY,
+        worker_id INTEGER,
+        worker_name TEXT NOT NULL,
+        certificate_type TEXT NOT NULL,
+        certificate_name TEXT NOT NULL,
+        issuing_organization TEXT,
+        issue_date DATE NOT NULL,
+        expiry_date DATE NOT NULL,
+        certificate_number TEXT,
+        file_url TEXT,
+        status TEXT DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `).catch(() => {});
+
+    // Update status based on expiry dates
+    await pool.query(`
+      UPDATE safety_certificates
+      SET status = CASE
+        WHEN expiry_date < CURRENT_DATE THEN 'expired'
+        WHEN expiry_date <= CURRENT_DATE + INTERVAL '30 days' THEN 'expiring_soon'
+        ELSE 'active'
+      END
+      WHERE worker_id = $1
+    `, [workerId]);
+
+    // Fetch certificates
+    const result = await pool.query(
+      `SELECT * FROM safety_certificates
+       WHERE worker_id = $1
+       ORDER BY
+         CASE status
+           WHEN 'expired' THEN 1
+           WHEN 'expiring_soon' THEN 2
+           ELSE 3
+         END,
+         expiry_date ASC`,
+      [workerId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching safety certificates:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Add sample certificates for testing
+app.post('/api/safety-certificates/add-samples/:workerId', async (req, res) => {
+  const { workerId } = req.params;
+
+  try {
+    // First ensure table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS safety_certificates (
+        id SERIAL PRIMARY KEY,
+        worker_id INTEGER,
+        worker_name TEXT NOT NULL,
+        certificate_type TEXT NOT NULL,
+        certificate_name TEXT NOT NULL,
+        issuing_organization TEXT,
+        issue_date DATE NOT NULL,
+        expiry_date DATE NOT NULL,
+        certificate_number TEXT,
+        file_url TEXT,
+        status TEXT DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `).catch(() => {});
+
+    // Get worker name
+    const userResult = await pool.query('SELECT name FROM users WHERE id = $1', [workerId]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Worker not found' });
+    }
+    const workerName = userResult.rows[0].name;
+
+    // Sample certificates
+    const samples = [
+      {
+        certificate_type: 'Safety Training',
+        certificate_name: 'OSHA 30-Hour Construction',
+        issuing_organization: 'OSHA',
+        issue_date: '2024-01-15',
+        expiry_date: '2026-01-15',
+        certificate_number: 'OSHA-2024-' + Math.random().toString(36).substr(2, 9).toUpperCase()
+      },
+      {
+        certificate_type: 'Medical',
+        certificate_name: 'First Aid & CPR',
+        issuing_organization: 'American Red Cross',
+        issue_date: '2024-06-01',
+        expiry_date: '2025-02-01', // Expiring soon
+        certificate_number: 'ARC-' + Math.random().toString(36).substr(2, 9).toUpperCase()
+      },
+      {
+        certificate_type: 'Equipment',
+        certificate_name: 'Forklift Operation',
+        issuing_organization: 'National Safety Council',
+        issue_date: '2023-03-15',
+        expiry_date: '2024-03-15', // Expired
+        certificate_number: 'NSC-FL-' + Math.random().toString(36).substr(2, 9).toUpperCase()
+      },
+      {
+        certificate_type: 'Safety Training',
+        certificate_name: 'Fall Protection',
+        issuing_organization: 'Construction Safety Institute',
+        issue_date: '2024-08-01',
+        expiry_date: '2025-08-01',
+        certificate_number: 'CSI-FP-' + Math.random().toString(36).substr(2, 9).toUpperCase()
+      }
+    ];
+
+    const inserted = [];
+    for (const cert of samples) {
+      const status = new Date(cert.expiry_date) < new Date() ? 'expired' :
+                    new Date(cert.expiry_date) <= new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) ? 'expiring_soon' :
+                    'active';
+
+      const result = await pool.query(
+        `INSERT INTO safety_certificates
+         (worker_id, worker_name, certificate_type, certificate_name, issuing_organization,
+          issue_date, expiry_date, certificate_number, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT DO NOTHING
+         RETURNING *`,
+        [workerId, workerName, cert.certificate_type, cert.certificate_name, cert.issuing_organization,
+         cert.issue_date, cert.expiry_date, cert.certificate_number, status]
+      );
+      if (result.rows.length > 0) {
+        inserted.push(result.rows[0]);
+      }
+    }
+
+    res.json({ message: 'Sample certificates added', certificates: inserted });
+  } catch (err) {
+    console.error('Error adding sample certificates:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/workers/:workerId/certifications', async (req, res) => {
   const { workerId } = req.params;
   const { name, issuer, issue_date, expiry_date } = req.body;
