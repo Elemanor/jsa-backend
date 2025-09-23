@@ -5748,12 +5748,12 @@ app.get('/api/work-areas/:workAreaId/activities', async (req, res) => {
     const query = `
       WITH daily_workers AS (
         SELECT
-          DATE(waw.assigned_date) as date,
+          waw.work_date as date,
           COUNT(DISTINCT waw.worker_id) as workers_count
         FROM work_area_workers waw
         WHERE waw.work_area_id = $1
-          AND DATE(waw.assigned_date) BETWEEN $2 AND $3
-        GROUP BY DATE(waw.assigned_date)
+          AND waw.work_date BETWEEN $2 AND $3
+        GROUP BY waw.work_date
       ),
       daily_signins AS (
         SELECT
@@ -5772,7 +5772,7 @@ app.get('/api/work-areas/:workAreaId/activities', async (req, res) => {
             SELECT 1 FROM work_area_workers waw
             WHERE waw.worker_id = ws.worker_id
               AND waw.work_area_id = $1
-              AND DATE(waw.assigned_date) = ws.signin_date
+              AND waw.work_date = ws.signin_date
           )
         GROUP BY ws.signin_date
       ),
