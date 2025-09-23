@@ -5737,5 +5737,61 @@ if (process.env.VERCEL !== '1') {
   });
 }
 
+// Get work area activities for calendar
+app.get('/api/work-areas/:workAreaId/activities', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { start, end } = req.query;
+
+  try {
+    // Get daily activities for the work area in the date range
+    const query = `
+      WITH daily_data AS (
+        SELECT
+          DATE(ws.created_at) as date,
+          COUNT(DISTINCT ws.worker_id) as workers_count,
+          COALESCE(SUM(
+            CASE
+              WHEN ws.sign_out_time IS NOT NULL THEN
+                EXTRACT(EPOCH FROM (ws.sign_out_time - ws.sign_in_time)) / 3600
+              ELSE 0
+            END
+          ), 0) as hours_worked
+        FROM worker_signins ws
+        WHERE ws.work_area_id = $1
+          AND DATE(ws.created_at) BETWEEN $2 AND $3
+        GROUP BY DATE(ws.created_at)
+      ),
+      photo_data AS (
+        SELECT
+          DATE(taken_at) as date,
+          COUNT(*) as photos_count
+        FROM area_photos
+        WHERE work_area_id = $1
+          AND DATE(taken_at) BETWEEN $2 AND $3
+        GROUP BY DATE(taken_at)
+      ),
+      all_dates AS (
+        SELECT generate_series($2::date, $3::date, '1 day'::interval)::date as date
+      )
+      SELECT
+        to_char(ad.date, 'YYYY-MM-DD') as date,
+        COALESCE(dd.workers_count, 0) as workers_count,
+        ROUND(COALESCE(dd.hours_worked, 0)::numeric, 1) as hours_worked,
+        COALESCE(pd.photos_count, 0) as photos_count,
+        (COALESCE(dd.workers_count, 0) > 0 OR COALESCE(pd.photos_count, 0) > 0) as has_activity
+      FROM all_dates ad
+      LEFT JOIN daily_data dd ON ad.date = dd.date
+      LEFT JOIN photo_data pd ON ad.date = pd.date
+      ORDER BY ad.date
+    `;
+
+    const result = await pool.query(query, [workAreaId, start, end]);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching work area activities:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Export for Vercel
 module.exports = app;
