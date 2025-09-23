@@ -5693,6 +5693,42 @@ app.delete('/api/workers/:workerId/certifications/:certId', async (req, res) => 
   }
 });
 
+// Photo endpoints
+app.get('/api/photos/work-area/:workAreaId', async (req, res) => {
+  const { workAreaId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM area_photos
+       WHERE work_area_id = $1
+       ORDER BY taken_at DESC`,
+      [workAreaId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching work area photos:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get all photos for a specific area
+app.get('/api/area-photos/:areaId', async (req, res) => {
+  const { areaId } = req.params;
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM area_photos
+       WHERE work_area_id = $1
+       ORDER BY taken_at DESC`,
+      [areaId]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching area photos:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Start server if not in Vercel environment
 if (process.env.VERCEL !== '1') {
   const PORT = process.env.PORT || 3001;
