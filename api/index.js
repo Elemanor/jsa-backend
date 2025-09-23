@@ -6066,9 +6066,6 @@ app.post('/api/work-areas/:workAreaId/workers/simple', async (req, res) => {
   }
 });
 
-// In-memory storage for worker assignments (temporary solution)
-const workerAssignments = new Map();
-
 app.post('/api/work-areas/:workAreaId/workers', async (req, res) => {
   const { workAreaId } = req.params;
   const { worker_id, work_date } = req.body;
@@ -6084,32 +6081,103 @@ app.post('/api/work-areas/:workAreaId/workers', async (req, res) => {
       return res.status(400).json({ error: 'Invalid worker_id - must be a number' });
     }
 
-    // Use in-memory storage as a fallback
+    // Get worker name from users table
+    let workerName = null;
+    try {
+      const workerResult = await pool.query(
+        'SELECT name FROM users WHERE id = $1',
+        [workerId]
+      );
+      if (workerResult.rows.length > 0) {
+        workerName = workerResult.rows[0].name;
+      }
+    } catch (e) {
+      console.log('Error looking up worker name:', e.message);
+    }
+
+    // Use current date if not provided
     const assignmentDate = work_date || new Date().toISOString().split('T')[0];
-    const assignmentKey = `${workAreaId}-${workerId}-${assignmentDate}`;
 
-    // Store in memory
-    const assignment = {
-      id: Date.now(),
-      work_area_id: workAreaId,
-      worker_id: workerId,
-      work_date: assignmentDate,
-      worker_name: `Worker ${workerId}`,
-      assigned_at: new Date().toISOString()
-    };
+    // Try to insert into database
+    try {
+      const result = await pool.query(
+        `INSERT INTO work_area_workers (work_area_id, worker_id, work_date, worker_name)
+         VALUES ($1::uuid, $2, $3, $4)
+         ON CONFLICT (work_area_id, worker_id, work_date)
+         DO UPDATE SET
+           worker_name = EXCLUDED.worker_name,
+           updated_at = CURRENT_TIMESTAMP
+         RETURNING *`,
+        [workAreaId, workerId, assignmentDate, workerName]
+      );
 
-    workerAssignments.set(assignmentKey, assignment);
+      console.log('Worker assigned successfully:', result.rows[0]);
+      res.json(result.rows[0]);
+    } catch (dbErr) {
+      console.error('Database error:', dbErr.message);
+      console.error('Error code:', dbErr.code);
 
-    console.log('Worker assigned successfully (in-memory):', assignment);
+      // If table doesn't exist, create it
+      if (dbErr.code === '42P01') { // undefined_table
+        console.log('Table does not exist, attempting to create...');
 
-    // Return success response
-    res.json(assignment);
+        try {
+          // Create the table
+          await pool.query(`
+            CREATE TABLE work_area_workers (
+              id SERIAL PRIMARY KEY,
+              work_area_id UUID NOT NULL,
+              worker_id INTEGER NOT NULL,
+              work_date DATE DEFAULT CURRENT_DATE,
+              worker_name VARCHAR(255),
+              assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              hours_worked DECIMAL(4,2),
+              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+          `);
+
+          // Create unique constraint
+          await pool.query(`
+            CREATE UNIQUE INDEX unique_work_area_worker_date
+            ON work_area_workers(work_area_id, worker_id, work_date)
+          `);
+
+          console.log('Table created successfully, retrying insert...');
+
+          // Retry the insert
+          const retryResult = await pool.query(
+            `INSERT INTO work_area_workers (work_area_id, worker_id, work_date, worker_name)
+             VALUES ($1::uuid, $2, $3, $4)
+             RETURNING *`,
+            [workAreaId, workerId, assignmentDate, workerName]
+          );
+
+          res.json(retryResult.rows[0]);
+        } catch (createErr) {
+          console.error('Failed to create table:', createErr);
+          res.status(500).json({
+            error: 'Database table creation failed',
+            detail: createErr.message,
+            hint: 'Please run the SQL migration script manually in Supabase'
+          });
+        }
+      } else {
+        // Other database errors
+        res.status(500).json({
+          error: 'Database operation failed',
+          code: dbErr.code,
+          detail: dbErr.message,
+          hint: 'Check if work_area_id exists and is valid UUID'
+        });
+      }
+    }
 
   } catch (err) {
     console.error('Unexpected error:', err);
     res.status(500).json({
       error: 'Server error',
-      message: 'Failed to assign worker'
+      message: err.message
     });
   }
 });
