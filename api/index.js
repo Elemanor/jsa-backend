@@ -5828,30 +5828,78 @@ app.get('/api/work-areas/:workAreaId/daily-tasks', async (req, res) => {
   }
 });
 
-app.post('/api/work-areas/:workAreaId/daily-tasks', async (req, res) => {
+// Get timeline of tasks for date range
+app.get('/api/work-areas/:workAreaId/timeline', async (req, res) => {
   const { workAreaId } = req.params;
-  const { date, task_type, status = 'in_progress' } = req.body;
+  const { start, end } = req.query;
 
   try {
-    // Calculate sequence order
+    const result = await pool.query(
+      `SELECT
+        dt.*,
+        dt.task_date as start_date,
+        CASE
+          WHEN dt.status = 'completed' THEN dt.task_date
+          WHEN dt.status = 'in_progress' THEN CURRENT_DATE
+          ELSE dt.task_date + INTERVAL '1 day'
+        END as end_date,
+        CASE
+          WHEN dt.status = 'completed' THEN 1
+          WHEN dt.status = 'in_progress' THEN
+            GREATEST(1, EXTRACT(DAY FROM CURRENT_DATE - dt.task_date))
+          ELSE 1
+        END as duration_days
+       FROM daily_tasks dt
+       WHERE dt.work_area_id = $1
+         AND dt.task_date BETWEEN $2 AND $3
+       ORDER BY dt.task_date, dt.sequence_order`,
+      [workAreaId, start, end]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching timeline:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/work-areas/:workAreaId/daily-tasks', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { date, task_type, status = 'in_progress', continue_previous } = req.body;
+
+  try {
+    // Check if we should continue a previous task
+    if (continue_previous) {
+      // Find the most recent task of this type
+      const previousTask = await pool.query(
+        `SELECT * FROM daily_tasks
+         WHERE work_area_id = $1 AND task_type = $2 AND status = 'in_progress'
+         ORDER BY task_date DESC
+         LIMIT 1`,
+        [workAreaId, task_type]
+      );
+
+      if (previousTask.rows.length > 0) {
+        // Task continues from previous day
+        res.json(previousTask.rows[0]);
+        return;
+      }
+    }
+
+    // Calculate sequence order for the entire work area timeline
     const sequenceResult = await pool.query(
       `SELECT MAX(sequence_order) as max_order FROM daily_tasks
-       WHERE work_area_id = $1 AND task_date = $2`,
-      [workAreaId, date]
+       WHERE work_area_id = $1`,
+      [workAreaId]
     );
     const sequence_order = (sequenceResult.rows[0].max_order || 0) + 1;
 
-    // Set default times based on task sequence
-    const start_time = `${7 + sequence_order * 2}:00`;
-    const end_time = `${9 + sequence_order * 2}:00`;
-
     const result = await pool.query(
-      `INSERT INTO daily_tasks (work_area_id, task_date, task_type, status, sequence_order, start_time, end_time)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO daily_tasks (work_area_id, task_date, task_type, status, sequence_order)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (work_area_id, task_date, task_type)
        DO UPDATE SET status = $4, updated_at = CURRENT_TIMESTAMP
        RETURNING *`,
-      [workAreaId, date, task_type, status, sequence_order, start_time, end_time]
+      [workAreaId, date, task_type, status, sequence_order]
     );
     res.json(result.rows[0]);
   } catch (err) {
