@@ -5927,7 +5927,7 @@ app.post('/api/work-areas/:workAreaId/daily-tasks', async (req, res) => {
 
 app.patch('/api/daily-tasks/:taskId', async (req, res) => {
   const { taskId } = req.params;
-  const { status, end_time } = req.body;
+  const { status, end_time, end_date, duration_days } = req.body;
 
   try {
     let query = 'UPDATE daily_tasks SET updated_at = CURRENT_TIMESTAMP';
@@ -5946,6 +5946,18 @@ app.patch('/api/daily-tasks/:taskId', async (req, res) => {
       paramCount++;
     }
 
+    if (end_date) {
+      query += `, end_date = $${paramCount}`;
+      params.push(end_date);
+      paramCount++;
+    }
+
+    if (duration_days) {
+      query += `, duration_days = $${paramCount}`;
+      params.push(duration_days);
+      paramCount++;
+    }
+
     // If task is completed, set end_time to current time
     if (status === 'completed' && !end_time) {
       const now = new Date();
@@ -5961,6 +5973,27 @@ app.patch('/api/daily-tasks/:taskId', async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     console.error('Error updating task:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete daily task endpoint
+app.delete('/api/daily-tasks/:taskId', async (req, res) => {
+  const { taskId } = req.params;
+
+  try {
+    const result = await pool.query(
+      'DELETE FROM daily_tasks WHERE id = $1 RETURNING *',
+      [taskId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    res.json({ message: 'Task deleted successfully', task: result.rows[0] });
+  } catch (err) {
+    console.error('Error deleting task:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -6001,17 +6034,61 @@ app.post('/api/work-areas/:workAreaId/workers', async (req, res) => {
   const { worker_id, work_date } = req.body;
 
   try {
+    // Convert worker_id to integer if it's a string
+    const workerId = parseInt(worker_id, 10);
+
+    if (isNaN(workerId)) {
+      return res.status(400).json({ error: 'Invalid worker_id' });
+    }
+
+    // First ensure the table exists with correct structure
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS work_area_workers (
+        id SERIAL PRIMARY KEY,
+        work_area_id UUID NOT NULL,
+        worker_id INTEGER NOT NULL,
+        work_date DATE NOT NULL,
+        worker_name VARCHAR(255),
+        assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        hours_worked DECIMAL(4,2),
+        UNIQUE(work_area_id, worker_id, work_date)
+      )
+    `).catch(() => {});
+
+    // Get worker name from users table
+    let workerName = null;
+    try {
+      const workerResult = await pool.query(
+        'SELECT name FROM users WHERE id = $1',
+        [workerId]
+      );
+      if (workerResult.rows.length > 0) {
+        workerName = workerResult.rows[0].name;
+      } else {
+        console.log(`Worker with id ${workerId} not found in users table`);
+      }
+    } catch (e) {
+      console.log('Error looking up worker name:', e.message);
+    }
+
+    // Insert into work_area_workers table
     const result = await pool.query(
-      `INSERT INTO work_area_workers (work_area_id, worker_id, work_date, assigned_at)
-       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-       ON CONFLICT DO NOTHING
+      `INSERT INTO work_area_workers (work_area_id, worker_id, work_date, worker_name, assigned_at)
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+       ON CONFLICT (work_area_id, worker_id, work_date) DO UPDATE
+       SET worker_name = $4, assigned_at = CURRENT_TIMESTAMP
        RETURNING *`,
-      [workAreaId, worker_id, work_date]
+      [workAreaId, workerId, work_date || new Date().toISOString().split('T')[0], workerName]
     );
     res.json(result.rows[0]);
   } catch (err) {
     console.error('Error assigning worker:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Request body:', req.body);
+    console.error('Params:', { workAreaId, worker_id, work_date });
+    res.status(500).json({
+      error: err.message,
+      detail: err.detail || 'Error assigning worker to work area'
+    });
   }
 });
 
