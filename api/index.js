@@ -5751,7 +5751,7 @@ app.get('/api/work-areas/:workAreaId/activities', async (req, res) => {
           waw.work_date as date,
           COUNT(DISTINCT waw.worker_id) as workers_count
         FROM work_area_workers waw
-        WHERE waw.work_area_id = $1
+        WHERE waw.work_area_id = $1::uuid
           AND waw.work_date BETWEEN $2 AND $3
         GROUP BY waw.work_date
       ),
@@ -5771,7 +5771,7 @@ app.get('/api/work-areas/:workAreaId/activities', async (req, res) => {
           AND EXISTS (
             SELECT 1 FROM work_area_workers waw
             WHERE waw.worker_id = ws.worker_id
-              AND waw.work_area_id = $1
+              AND waw.work_area_id = $1::uuid
               AND waw.work_date = ws.signin_date
           )
         GROUP BY ws.signin_date
@@ -5781,7 +5781,7 @@ app.get('/api/work-areas/:workAreaId/activities', async (req, res) => {
           DATE(taken_at) as date,
           COUNT(*) as photos_count
         FROM area_photos
-        WHERE work_area_id = $1
+        WHERE work_area_id = $1::uuid
           AND DATE(taken_at) BETWEEN $2 AND $3
         GROUP BY DATE(taken_at)
       ),
