@@ -5781,7 +5781,7 @@ app.get('/api/work-areas/:workAreaId/activities', async (req, res) => {
           DATE(taken_at) as date,
           COUNT(*) as photos_count
         FROM area_photos
-        WHERE work_area_id = $1
+        WHERE work_area_id::varchar = $1
           AND DATE(taken_at) BETWEEN $2 AND $3
         GROUP BY DATE(taken_at)
       ),
