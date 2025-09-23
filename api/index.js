@@ -4945,6 +4945,22 @@ app.put('/api/work-orders/:id/status', async (req, res) => {
 });
 
 // Worker Profile endpoints
+
+// Get available workers - MUST BE BEFORE dynamic :workerId route
+app.get('/api/workers/available', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, role
+       FROM workers
+       ORDER BY name`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching available workers:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/workers/:workerId', async (req, res) => {
   const { workerId } = req.params;
 
@@ -6012,21 +6028,6 @@ app.delete('/api/work-areas/:workAreaId/workers/:workerId', async (req, res) => 
     res.json({ success: true });
   } catch (err) {
     console.error('Error removing worker:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Get available workers
-app.get('/api/workers/available', async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, name, role
-       FROM workers
-       ORDER BY name`
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching available workers:', err);
     res.status(500).json({ error: err.message });
   }
 });
