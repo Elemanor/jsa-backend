@@ -510,7 +510,7 @@ app.post('/api/auth/login', async (req, res) => {
             await pool.query(`
               INSERT INTO attendance (
                 worker_name, date, status,
-                check_in_time, sign_in_latitude, sign_in_longitude, sign_in_address
+                check_in_time, latitude, longitude, address
               ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
               [user.name, today, 'present', checkInTime, latitude, longitude, address || null]
             );
@@ -519,9 +519,9 @@ app.post('/api/auth/login', async (req, res) => {
             // Update existing attendance with GPS data if not already set
             await pool.query(`
               UPDATE attendance
-              SET sign_in_latitude = COALESCE(sign_in_latitude, $1),
-                  sign_in_longitude = COALESCE(sign_in_longitude, $2),
-                  sign_in_address = COALESCE(sign_in_address, $3),
+              SET latitude = COALESCE(latitude, $1),
+                  longitude = COALESCE(longitude, $2),
+                  address = COALESCE(address, $3),
                   check_in_time = COALESCE(check_in_time, $4),
                   status = 'present'
               WHERE LOWER(worker_name) = LOWER($5) AND date = $6`,
