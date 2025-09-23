@@ -1029,13 +1029,35 @@ app.post('/api/timesheets', async (req, res) => {
       // Column might already exist, ignore error
     });
 
+    // Calculate total hours from start and end times
+    let calculatedTotalHours = total_hours || 0;
+    if (start_time && end_time) {
+      const [startHour, startMin] = start_time.split(':').map(Number);
+      const [endHour, endMin] = end_time.split(':').map(Number);
+
+      // Calculate duration in minutes
+      let durationMinutes = (endHour * 60 + endMin) - (startHour * 60 + startMin);
+
+      // Handle overnight shifts (if end time is before start time, add 24 hours)
+      if (durationMinutes < 0) {
+        durationMinutes += 24 * 60;
+      }
+
+      // Subtract break duration (convert from decimal hours to minutes)
+      const breakMinutes = parseFloat(break_duration || 0) * 60;
+      durationMinutes -= breakMinutes;
+
+      // Convert to hours (rounded to 2 decimal places)
+      calculatedTotalHours = Math.round((durationMinutes / 60) * 100) / 100;
+    }
+
     // Calculate regular and overtime hours
-    const regularHours = Math.min(total_hours, 8);
-    const overtimeHours = Math.max(total_hours - 8, 0);
+    const regularHours = Math.min(calculatedTotalHours, 8);
+    const overtimeHours = Math.max(calculatedTotalHours - 8, 0);
 
     const result = await pool.query(
       'INSERT INTO timesheets (worker_id, worker_name, date, project_name, start_time, end_time, break_duration, total_hours, regular_hours, overtime_hours, notes, week_number) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *',
-      [worker_id, worker_name, date, project_name, start_time, end_time, break_duration || 0, total_hours, regularHours, overtimeHours, notes || '', weekNumber]
+      [worker_id, worker_name, date, project_name, start_time, end_time, break_duration || 0, calculatedTotalHours, regularHours, overtimeHours, notes || '', weekNumber]
     );
 
     // Automatically mark attendance as present when submitting timesheet
