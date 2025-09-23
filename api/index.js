@@ -1249,6 +1249,38 @@ app.get('/api/worker-signins', async (req, res) => {
   }
 });
 
+// Get signed-in workers (currently signed in, not signed out)
+app.get('/api/signed-in-workers', async (req, res) => {
+  const { date } = req.query;
+
+  try {
+    let query = `
+      SELECT
+        ws.*,
+        u.id as worker_id,
+        u.role,
+        u.phone
+      FROM worker_signins ws
+      LEFT JOIN users u ON LOWER(ws.worker_name) = LOWER(u.name)
+      WHERE ws.signout_time IS NULL
+    `;
+    const params = [];
+
+    if (date) {
+      params.push(date);
+      query += ` AND ws.signin_date = $${params.length}`;
+    }
+
+    query += ' ORDER BY ws.signin_time DESC';
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching signed-in workers:', err);
+    res.json([]);
+  }
+});
+
 // Add concrete delivery
 app.post('/api/concrete-deliveries', async (req, res) => {
   // Handle both old and new field formats
