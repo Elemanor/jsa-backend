@@ -5744,22 +5744,37 @@ app.get('/api/work-areas/:workAreaId/activities', async (req, res) => {
 
   try {
     // Get daily activities for the work area in the date range
+    // Since worker_signins doesn't have work_area_id, we'll use work_area_workers table
     const query = `
-      WITH daily_data AS (
+      WITH daily_workers AS (
         SELECT
-          DATE(ws.created_at) as date,
-          COUNT(DISTINCT ws.worker_id) as workers_count,
+          DATE(waw.assigned_date) as date,
+          COUNT(DISTINCT waw.worker_id) as workers_count
+        FROM work_area_workers waw
+        WHERE waw.work_area_id = $1
+          AND DATE(waw.assigned_date) BETWEEN $2 AND $3
+        GROUP BY DATE(waw.assigned_date)
+      ),
+      daily_signins AS (
+        SELECT
+          ws.signin_date as date,
+          COUNT(DISTINCT ws.worker_id) as workers_signed_in,
           COALESCE(SUM(
             CASE
-              WHEN ws.sign_out_time IS NOT NULL THEN
-                EXTRACT(EPOCH FROM (ws.sign_out_time - ws.sign_in_time)) / 3600
+              WHEN ws.signout_time IS NOT NULL THEN
+                EXTRACT(EPOCH FROM (ws.signout_time - ws.signin_time)) / 3600
               ELSE 0
             END
           ), 0) as hours_worked
         FROM worker_signins ws
-        WHERE ws.work_area_id = $1
-          AND DATE(ws.created_at) BETWEEN $2 AND $3
-        GROUP BY DATE(ws.created_at)
+        WHERE ws.signin_date BETWEEN $2 AND $3
+          AND EXISTS (
+            SELECT 1 FROM work_area_workers waw
+            WHERE waw.worker_id = ws.worker_id
+              AND waw.work_area_id = $1
+              AND DATE(waw.assigned_date) = ws.signin_date
+          )
+        GROUP BY ws.signin_date
       ),
       photo_data AS (
         SELECT
@@ -5775,12 +5790,13 @@ app.get('/api/work-areas/:workAreaId/activities', async (req, res) => {
       )
       SELECT
         to_char(ad.date, 'YYYY-MM-DD') as date,
-        COALESCE(dd.workers_count, 0) as workers_count,
-        ROUND(COALESCE(dd.hours_worked, 0)::numeric, 1) as hours_worked,
+        COALESCE(ds.workers_signed_in, dw.workers_count, 0) as workers_count,
+        ROUND(COALESCE(ds.hours_worked, 0)::numeric, 1) as hours_worked,
         COALESCE(pd.photos_count, 0) as photos_count,
-        (COALESCE(dd.workers_count, 0) > 0 OR COALESCE(pd.photos_count, 0) > 0) as has_activity
+        (COALESCE(ds.workers_signed_in, dw.workers_count, 0) > 0 OR COALESCE(pd.photos_count, 0) > 0) as has_activity
       FROM all_dates ad
-      LEFT JOIN daily_data dd ON ad.date = dd.date
+      LEFT JOIN daily_workers dw ON ad.date = dw.date
+      LEFT JOIN daily_signins ds ON ad.date = ds.date
       LEFT JOIN photo_data pd ON ad.date = pd.date
       ORDER BY ad.date
     `;
