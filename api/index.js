@@ -2077,7 +2077,74 @@ app.get('/api/workers/debug-all', async (req, res) => {
   }
 });
 
-// Get attendance for a specific date
+// Get attendance with query parameter
+app.get('/api/attendance', async (req, res) => {
+  const { date } = req.query;
+
+  if (!date) {
+    return res.status(400).json({ error: 'Date parameter is required' });
+  }
+
+  try {
+    // Get all workers from users table
+    const workersResult = await pool.query(
+      `SELECT id, name, role FROM users ORDER BY name`
+    );
+
+    // Get all attendance records for the date
+    const attendanceResult = await pool.query(
+      'SELECT * FROM attendance WHERE date = $1',
+      [date]
+    );
+
+    console.log(`Found ${attendanceResult.rows.length} attendance records for ${date}`);
+
+    // Create a map of attendance by both worker_id and worker_name
+    const attendanceByIdMap = {};
+    const attendanceByNameMap = {};
+
+    attendanceResult.rows.forEach(record => {
+      if (record.worker_id) {
+        attendanceByIdMap[record.worker_id] = record;
+      }
+      if (record.worker_name) {
+        // Store by lowercase name for case-insensitive matching
+        attendanceByNameMap[record.worker_name.toLowerCase()] = record;
+      }
+    });
+
+    // Combine workers with attendance data
+    const attendanceData = workersResult.rows.map(worker => {
+      // Try to find attendance by ID first, then by name
+      const attendanceRecord = attendanceByIdMap[worker.id] ||
+                              attendanceByNameMap[worker.name.toLowerCase()];
+
+      return {
+        id: worker.id,
+        worker_id: worker.id,
+        worker_name: worker.name,
+        name: worker.name,
+        role: worker.role,
+        date: date,
+        status: attendanceRecord ? attendanceRecord.status : 'absent',
+        check_in_time: attendanceRecord ? attendanceRecord.check_in_time : null,
+        check_out_time: attendanceRecord ? attendanceRecord.check_out_time : null,
+        latitude: attendanceRecord ? attendanceRecord.latitude : null,
+        longitude: attendanceRecord ? attendanceRecord.longitude : null,
+        address: attendanceRecord ? attendanceRecord.address : null,
+        sign_in_address: attendanceRecord ? attendanceRecord.address : null,
+        attendance_id: attendanceRecord ? attendanceRecord.id : null
+      };
+    });
+
+    res.json(attendanceData);
+  } catch (err) {
+    console.error('Error fetching attendance:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get attendance for a specific date (path parameter version)
 app.get('/api/attendance/:date', async (req, res) => {
   const { date } = req.params;
 
