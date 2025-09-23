@@ -4707,60 +4707,34 @@ app.get('/api/timesheets/weekly', async (req, res) => {
   const { userId, startDate, endDate } = req.query;
 
   try {
-    // Ensure timesheets table exists
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS timesheets (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER,
-        date DATE,
-        sign_in_time TIME,
-        sign_out_time TIME,
-        break_duration INTEGER DEFAULT 0,
-        total_hours DECIMAL(4,2),
-        overtime_hours DECIMAL(4,2) DEFAULT 0,
-        project_name VARCHAR(255),
-        task_description TEXT,
-        status VARCHAR(50) DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-
-    // For now, insert the actual worked hours for Monday Sep 22, 2025
-    // 06:00 to 11:30 with one 30-minute break = 5 hours total
-    const checkExisting = await pool.query(
-      `SELECT * FROM timesheets WHERE user_id = $1 AND date = '2025-09-22'`,
-      [userId || 1]
-    );
-
-    if (checkExisting.rows.length === 0) {
-      await pool.query(
-        `INSERT INTO timesheets (user_id, date, sign_in_time, sign_out_time, break_duration, total_hours, project_name, task_description)
-         VALUES ($1, '2025-09-22', '06:00', '11:30', 30, 5.0, 'Main Site', 'Foundation work')`,
-        [userId || 1]
-      );
-    }
-
-    // Fetch timesheets for the requested period
+    // Fetch timesheets for the requested period using existing column names
     let query = `
       SELECT
         date,
-        sign_in_time,
-        sign_out_time,
-        break_duration,
-        total_hours,
-        overtime_hours,
+        start_time as sign_in_time,
+        end_time as sign_out_time,
+        COALESCE(break_duration, break_hours * 60, 0) as break_duration,
+        COALESCE(total_hours, hours_worked, 0) as total_hours,
+        COALESCE(overtime_hours, 0) as overtime_hours,
         project_name,
-        task_description,
-        status
+        work_description as task_description,
+        COALESCE(status, 'pending') as status
       FROM timesheets
       WHERE 1=1
     `;
 
     const params = [];
+
     if (userId) {
-      params.push(userId);
-      query += ` AND user_id = $${params.length}`;
+      // Try to match by worker_id or by worker_name from users table
+      const userResult = await pool.query('SELECT name FROM users WHERE id = $1', [userId]);
+      if (userResult.rows.length > 0) {
+        params.push(userId, userResult.rows[0].name);
+        query += ` AND (worker_id = $1 OR worker_name = $2)`;
+      } else {
+        params.push(userId);
+        query += ` AND worker_id = $1`;
+      }
     }
 
     if (startDate) {
@@ -4782,7 +4756,7 @@ app.get('/api/timesheets/weekly', async (req, res) => {
       timesheets: result.rows
     });
   } catch (err) {
-    console.error('Error fetching timesheets:', err);
+    console.error('Error fetching weekly timesheets:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -4799,8 +4773,8 @@ app.get('/api/timesheets/history', async (req, res) => {
       SELECT
         date_trunc('week', date) as week_start,
         COUNT(DISTINCT date) as days_worked,
-        SUM(total_hours) as total_hours,
-        SUM(overtime_hours) as overtime_hours,
+        SUM(COALESCE(total_hours, hours_worked, 0)) as total_hours,
+        SUM(COALESCE(overtime_hours, 0)) as overtime_hours,
         STRING_AGG(DISTINCT project_name, ', ') as projects
       FROM timesheets
       WHERE date >= $1
@@ -4810,7 +4784,7 @@ app.get('/api/timesheets/history', async (req, res) => {
 
     if (userId) {
       params.push(userId);
-      query += ` AND user_id = $${params.length}`;
+      query += ` AND (worker_id = $${params.length} OR worker_name = (SELECT name FROM users WHERE id = $${params.length}))`;
     }
 
     query += ` GROUP BY date_trunc('week', date)
