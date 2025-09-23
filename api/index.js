@@ -5809,5 +5809,199 @@ app.get('/api/work-areas/:workAreaId/activities', async (req, res) => {
   }
 });
 
+// Daily tasks endpoints
+app.get('/api/work-areas/:workAreaId/daily-tasks', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { date } = req.query;
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM daily_tasks
+       WHERE work_area_id = $1 AND task_date = $2
+       ORDER BY sequence_order, created_at`,
+      [workAreaId, date]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching daily tasks:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/work-areas/:workAreaId/daily-tasks', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { date, task_type, status = 'in_progress' } = req.body;
+
+  try {
+    // Calculate sequence order
+    const sequenceResult = await pool.query(
+      `SELECT MAX(sequence_order) as max_order FROM daily_tasks
+       WHERE work_area_id = $1 AND task_date = $2`,
+      [workAreaId, date]
+    );
+    const sequence_order = (sequenceResult.rows[0].max_order || 0) + 1;
+
+    // Set default times based on task sequence
+    const start_time = `${7 + sequence_order * 2}:00`;
+    const end_time = `${9 + sequence_order * 2}:00`;
+
+    const result = await pool.query(
+      `INSERT INTO daily_tasks (work_area_id, task_date, task_type, status, sequence_order, start_time, end_time)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (work_area_id, task_date, task_type)
+       DO UPDATE SET status = $4, updated_at = CURRENT_TIMESTAMP
+       RETURNING *`,
+      [workAreaId, date, task_type, status, sequence_order, start_time, end_time]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error creating daily task:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch('/api/daily-tasks/:taskId', async (req, res) => {
+  const { taskId } = req.params;
+  const { status, end_time } = req.body;
+
+  try {
+    let query = 'UPDATE daily_tasks SET updated_at = CURRENT_TIMESTAMP';
+    const params = [];
+    let paramCount = 1;
+
+    if (status) {
+      query += `, status = $${paramCount}`;
+      params.push(status);
+      paramCount++;
+    }
+
+    if (end_time) {
+      query += `, end_time = $${paramCount}`;
+      params.push(end_time);
+      paramCount++;
+    }
+
+    // If task is completed, set end_time to current time
+    if (status === 'completed' && !end_time) {
+      const now = new Date();
+      query += `, end_time = $${paramCount}`;
+      params.push(`${now.getHours()}:${now.getMinutes()}`);
+      paramCount++;
+    }
+
+    query += ` WHERE id = $${paramCount} RETURNING *`;
+    params.push(taskId);
+
+    const result = await pool.query(query, params);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error updating task:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Worker assignment endpoints
+app.get('/api/work-areas/:workAreaId/workers', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { date } = req.query;
+
+  try {
+    const result = await pool.query(
+      `SELECT
+        waw.worker_id,
+        w.name as worker_name,
+        waw.assigned_at,
+        CASE
+          WHEN ws.signout_time IS NOT NULL THEN
+            EXTRACT(EPOCH FROM (ws.signout_time - ws.signin_time)) / 3600
+          ELSE NULL
+        END as hours_worked
+       FROM work_area_workers waw
+       JOIN workers w ON w.id = waw.worker_id
+       LEFT JOIN worker_signins ws ON ws.worker_id = waw.worker_id
+         AND ws.signin_date = waw.work_date
+       WHERE waw.work_area_id = $1 AND waw.work_date = $2
+       ORDER BY w.name`,
+      [workAreaId, date]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching assigned workers:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/work-areas/:workAreaId/workers', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { worker_id, work_date } = req.body;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO work_area_workers (work_area_id, worker_id, work_date, assigned_at)
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
+       ON CONFLICT DO NOTHING
+       RETURNING *`,
+      [workAreaId, worker_id, work_date]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error assigning worker:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/work-areas/:workAreaId/workers/:workerId', async (req, res) => {
+  const { workAreaId, workerId } = req.params;
+  const { date } = req.query;
+
+  try {
+    await pool.query(
+      `DELETE FROM work_area_workers
+       WHERE work_area_id = $1 AND worker_id = $2 AND work_date = $3`,
+      [workAreaId, workerId, date]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Error removing worker:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get available workers
+app.get('/api/workers/available', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, role
+       FROM workers
+       WHERE status = 'active'
+       ORDER BY name`
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching available workers:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get photos for specific date
+app.get('/api/work-areas/:workAreaId/photos', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { date } = req.query;
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM area_photos
+       WHERE work_area_id::varchar = $1
+         AND DATE(taken_at) = $2
+       ORDER BY taken_at DESC`,
+      [workAreaId, date]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching photos:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Export for Vercel
 module.exports = app;
