@@ -6033,30 +6033,50 @@ app.post('/api/work-areas/:workAreaId/workers', async (req, res) => {
   const { workAreaId } = req.params;
   const { worker_id, work_date } = req.body;
 
+  console.log('Adding worker to work area:', { workAreaId, worker_id, work_date });
+
   try {
+    // Validate UUID format for workAreaId
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(workAreaId)) {
+      console.error('Invalid UUID format:', workAreaId);
+      return res.status(400).json({ error: 'Invalid work area ID format' });
+    }
+
     // Convert worker_id to integer if it's a string
     const workerId = parseInt(worker_id, 10);
 
     if (isNaN(workerId)) {
-      return res.status(400).json({ error: 'Invalid worker_id' });
+      console.error('Invalid worker_id:', worker_id);
+      return res.status(400).json({ error: 'Invalid worker_id - must be a number' });
     }
 
     // First ensure the table exists with correct structure
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS work_area_workers (
-        id SERIAL PRIMARY KEY,
-        work_area_id UUID NOT NULL,
-        worker_id INTEGER NOT NULL,
-        work_date DATE NOT NULL,
-        worker_name VARCHAR(255),
-        assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        hours_worked DECIMAL(4,2),
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS work_area_workers (
+          id SERIAL PRIMARY KEY,
+          work_area_id UUID NOT NULL,
+          worker_id INTEGER NOT NULL,
+          work_date DATE,
+          worker_name VARCHAR(255),
+          assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          hours_worked DECIMAL(4,2)
+        )
+      `);
+
+      // Add unique constraint if it doesn't exist
+      await pool.query(`
+        ALTER TABLE work_area_workers
+        ADD CONSTRAINT IF NOT EXISTS work_area_workers_unique
         UNIQUE(work_area_id, worker_id, work_date)
-      )
-    `).catch(() => {});
+      `).catch(() => {});
+    } catch (tableErr) {
+      console.log('Table creation/alteration notice:', tableErr.message);
+    }
 
     // Get worker name from users table
-    let workerName = null;
+    let workerName = 'Unknown Worker';
     try {
       const workerResult = await pool.query(
         'SELECT name FROM users WHERE id = $1',
@@ -6065,29 +6085,39 @@ app.post('/api/work-areas/:workAreaId/workers', async (req, res) => {
       if (workerResult.rows.length > 0) {
         workerName = workerResult.rows[0].name;
       } else {
-        console.log(`Worker with id ${workerId} not found in users table`);
+        console.log(`Worker with id ${workerId} not found in users table - using default name`);
       }
     } catch (e) {
       console.log('Error looking up worker name:', e.message);
     }
 
+    // Use current date if not provided
+    const assignmentDate = work_date || new Date().toISOString().split('T')[0];
+
     // Insert into work_area_workers table
     const result = await pool.query(
       `INSERT INTO work_area_workers (work_area_id, worker_id, work_date, worker_name, assigned_at)
-       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+       VALUES ($1::uuid, $2, $3::date, $4, CURRENT_TIMESTAMP)
        ON CONFLICT (work_area_id, worker_id, work_date) DO UPDATE
        SET worker_name = $4, assigned_at = CURRENT_TIMESTAMP
        RETURNING *`,
-      [workAreaId, workerId, work_date || new Date().toISOString().split('T')[0], workerName]
+      [workAreaId, workerId, assignmentDate, workerName]
     );
+
+    console.log('Worker assigned successfully:', result.rows[0]);
     res.json(result.rows[0]);
   } catch (err) {
-    console.error('Error assigning worker:', err);
+    console.error('Error assigning worker - Full error:', err);
+    console.error('Error code:', err.code);
+    console.error('Error detail:', err.detail);
     console.error('Request body:', req.body);
     console.error('Params:', { workAreaId, worker_id, work_date });
+
     res.status(500).json({
       error: err.message,
-      detail: err.detail || 'Error assigning worker to work area'
+      code: err.code,
+      detail: err.detail || 'Error assigning worker to work area',
+      hint: err.hint
     });
   }
 });
