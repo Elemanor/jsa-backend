@@ -5846,12 +5846,13 @@ app.get('/api/work-areas/:workAreaId/timeline', async (req, res) => {
         CASE
           WHEN dt.status = 'completed' THEN 1
           WHEN dt.status = 'in_progress' THEN
-            GREATEST(1, EXTRACT(DAY FROM CURRENT_DATE - dt.task_date))
+            GREATEST(1, (CURRENT_DATE - dt.task_date) + 1)
           ELSE 1
         END as duration_days
        FROM daily_tasks dt
        WHERE dt.work_area_id = $1
          AND dt.task_date BETWEEN $2 AND $3
+         AND dt.status != 'archived'
        ORDER BY dt.task_date, dt.sequence_order`,
       [workAreaId, start, end]
     );
@@ -6021,7 +6022,6 @@ app.get('/api/workers/available', async (req, res) => {
     const result = await pool.query(
       `SELECT id, name, role
        FROM workers
-       WHERE status = 'active'
        ORDER BY name`
     );
     res.json(result.rows);
