@@ -3573,7 +3573,7 @@ app.get('/api/work-areas/:areaId/workers', async (req, res) => {
        JOIN users u ON waw.worker_id = u.id
        LEFT JOIN worker_signins ws ON u.name = ws.worker_name
          AND ws.signin_date = waw.work_date
-       WHERE waw.work_area_id = $1::uuid AND waw.work_date = $2
+       WHERE waw.work_area_id::text = $1 AND waw.work_date = $2
        ORDER BY u.name`,
       [areaId, workDate]
     );
