@@ -6601,25 +6601,7 @@ app.delete('/api/work-areas/:workAreaId/workers/:workerId', async (req, res) => 
   }
 });
 
-// Get photos for specific date
-app.get('/api/work-areas/:workAreaId/photos', async (req, res) => {
-  const { workAreaId } = req.params;
-  const { date } = req.query;
-
-  try {
-    const result = await pool.query(
-      `SELECT * FROM area_photos
-       WHERE work_area_id::varchar = $1
-         AND DATE(taken_at) = $2
-       ORDER BY taken_at DESC`,
-      [workAreaId, date]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching photos:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
+// Duplicate endpoint removed - using the comprehensive one at line 3207 instead
 
 // Export for Vercel
 module.exports = app;
