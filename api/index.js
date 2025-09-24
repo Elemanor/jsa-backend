@@ -3472,22 +3472,33 @@ app.post('/api/work-areas/:areaId/assign-worker', async (req, res) => {
   const assignDate = date || getEasternDate();
 
   try {
-    // First ensure the table exists
+    // First ensure the table exists with proper structure
     await pool.query(`
       CREATE TABLE IF NOT EXISTS work_area_workers (
         id SERIAL PRIMARY KEY,
-        work_area_id INTEGER NOT NULL,
+        work_area_id UUID NOT NULL,
         worker_id INTEGER NOT NULL,
         work_date DATE NOT NULL,
+        worker_name VARCHAR(255),
         assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        hours_worked DECIMAL(4,2),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(work_area_id, worker_id, work_date)
       )
     `).catch(() => {});
 
+    // Get worker name
+    const workerResult = await pool.query(
+      'SELECT name FROM users WHERE id = $1',
+      [workerId]
+    );
+    const workerName = workerResult.rows.length > 0 ? workerResult.rows[0].name : null;
+
     // Check if assignment already exists
     const existing = await pool.query(
       `SELECT id FROM work_area_workers
-       WHERE work_area_id = $1 AND worker_id = $2 AND work_date = $3`,
+       WHERE work_area_id = $1::uuid AND worker_id = $2 AND work_date = $3`,
       [areaId, workerId, assignDate]
     );
 
@@ -3495,16 +3506,16 @@ app.post('/api/work-areas/:areaId/assign-worker', async (req, res) => {
       return res.json({ message: 'Worker already assigned to this area for today', success: true });
     }
 
-    // Create assignment
+    // Create assignment with worker name
     const result = await pool.query(
-      `INSERT INTO work_area_workers (work_area_id, worker_id, work_date, assigned_at)
-       VALUES ($1, $2, $3, NOW())
+      `INSERT INTO work_area_workers (work_area_id, worker_id, work_date, worker_name, assigned_at)
+       VALUES ($1::uuid, $2, $3, $4, NOW())
        RETURNING *`,
-      [areaId, workerId, assignDate]
+      [areaId, workerId, assignDate, workerName]
     );
 
-    console.log(`Assigned worker ${workerId} to work area ${areaId} for date ${assignDate}`);
-    res.json({ ...result.rows[0], success: true });
+    console.log(`Assigned worker ${workerName} (${workerId}) to work area ${areaId} for date ${assignDate}`);
+    res.json({ ...result.rows[0], success: true, worker_name: workerName });
   } catch (err) {
     console.error('Error assigning worker to work area:', err);
     res.status(500).json({ error: err.message });
@@ -3519,12 +3530,24 @@ app.get('/api/work-areas/:areaId/workers', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT u.id, u.name, u.role, waw.assigned_at, ws.signin_time as "signInTime"
+      `SELECT
+        u.id as worker_id,
+        u.name as worker_name,
+        u.name as user_name,
+        u.role,
+        waw.assigned_at,
+        ws.signin_time,
+        ws.signout_time,
+        CASE
+          WHEN ws.signout_time IS NOT NULL AND ws.signin_time IS NOT NULL
+          THEN EXTRACT(EPOCH FROM (ws.signout_time - ws.signin_time))/3600
+          ELSE NULL
+        END as hours_worked
        FROM work_area_workers waw
        JOIN users u ON waw.worker_id = u.id
        LEFT JOIN worker_signins ws ON u.name = ws.worker_name
          AND ws.signin_date = waw.work_date
-       WHERE waw.work_area_id = $1 AND waw.work_date = $2
+       WHERE waw.work_area_id = $1::uuid AND waw.work_date = $2
        ORDER BY u.name`,
       [areaId, workDate]
     );
