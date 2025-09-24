@@ -1175,7 +1175,7 @@ app.get('/api/workers', async (req, res) => {
         wd.worker_4step_cert
       FROM users u
       LEFT JOIN worker_details wd ON u.id = wd.user_id
-      WHERE u.role = 'worker'
+      WHERE u.role IN ('worker', 'foreman')
       ORDER BY u.name
     `);
 
