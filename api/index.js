@@ -31,7 +31,7 @@ const pool = new Pool({
 });
 
 // CORS configuration
-const corsOrigins = process.env.FRONTEND_URL 
+const corsOrigins = process.env.FRONTEND_URL
   ? [process.env.FRONTEND_URL, "http://localhost:5173", "http://localhost:5174", "https://mjr-jsa-app.netlify.app"]
   : ["http://localhost:5173", "http://localhost:5174"];
 
@@ -43,8 +43,19 @@ app.use(cors({
   preflightContinue: false,
   optionsSuccessStatus: 200
 }));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Increase limits for photo uploads
+app.use(express.json({ limit: '10mb' }));  // Reduced from 50mb to 10mb for Vercel
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
+
+// Add middleware to ensure CORS headers are always sent
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
+  next();
+});
 
 // Health check endpoint
 app.get('/health', (req, res) => {
