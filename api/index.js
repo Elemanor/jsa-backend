@@ -4901,6 +4901,155 @@ app.delete('/api/material-requests/:id', async (req, res) => {
   }
 });
 
+// RFI (Request for Information) endpoints
+app.get('/api/rfi', async (req, res) => {
+  try {
+    // Create RFI table if it doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS rfi_requests (
+        id SERIAL PRIMARY KEY,
+        worker_id INTEGER,
+        worker_name VARCHAR(255),
+        project_id INTEGER,
+        project_name VARCHAR(255),
+        subject VARCHAR(255) NOT NULL,
+        description TEXT NOT NULL,
+        priority VARCHAR(20) DEFAULT 'medium',
+        category VARCHAR(50),
+        attachments JSONB,
+        response TEXT,
+        responded_by VARCHAR(255),
+        responded_at TIMESTAMP,
+        status VARCHAR(50) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    const result = await pool.query(`
+      SELECT * FROM rfi_requests
+      ORDER BY
+        CASE
+          WHEN status = 'pending' THEN 0
+          WHEN status = 'in_review' THEN 1
+          WHEN status = 'answered' THEN 2
+          ELSE 3
+        END,
+        CASE priority
+          WHEN 'high' THEN 0
+          WHEN 'medium' THEN 1
+          WHEN 'low' THEN 2
+          ELSE 3
+        END,
+        created_at DESC
+    `);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching RFI requests:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/rfi', async (req, res) => {
+  const {
+    worker_id,
+    worker_name,
+    project_id,
+    project_name,
+    subject,
+    description,
+    priority,
+    category,
+    attachments
+  } = req.body;
+
+  try {
+    // Ensure table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS rfi_requests (
+        id SERIAL PRIMARY KEY,
+        worker_id INTEGER,
+        worker_name VARCHAR(255),
+        project_id INTEGER,
+        project_name VARCHAR(255),
+        subject VARCHAR(255) NOT NULL,
+        description TEXT NOT NULL,
+        priority VARCHAR(20) DEFAULT 'medium',
+        category VARCHAR(50),
+        attachments JSONB,
+        response TEXT,
+        responded_by VARCHAR(255),
+        responded_at TIMESTAMP,
+        status VARCHAR(50) DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    const result = await pool.query(`
+      INSERT INTO rfi_requests (
+        worker_id, worker_name, project_id, project_name,
+        subject, description, priority, category, attachments, status
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *
+    `, [
+      worker_id, worker_name, project_id, project_name,
+      subject, description, priority || 'medium', category,
+      attachments ? JSON.stringify(attachments) : null, 'pending'
+    ]);
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error creating RFI request:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/rfi/:id', async (req, res) => {
+  const { id } = req.params;
+  const { status, response, responded_by } = req.body;
+
+  try {
+    const result = await pool.query(`
+      UPDATE rfi_requests
+      SET status = $1, response = $2, responded_by = $3,
+          responded_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+      WHERE id = $4
+      RETURNING *
+    `, [status, response, responded_by, id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'RFI request not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error updating RFI request:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/rfi/:id', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const result = await pool.query(
+      'DELETE FROM rfi_requests WHERE id = $1 RETURNING *',
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'RFI request not found' });
+    }
+
+    res.json({ success: true, deleted: result.rows[0] });
+  } catch (err) {
+    console.error('Error deleting RFI request:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Timesheet endpoints for fetching real worked hours
 app.get('/api/timesheets/weekly', async (req, res) => {
   const { userId, startDate, endDate } = req.query;
