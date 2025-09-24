@@ -3534,7 +3534,7 @@ app.post('/api/work-areas/:areaId/assign-worker', async (req, res) => {
     // Check if assignment already exists
     const existing = await pool.query(
       `SELECT id FROM work_area_workers
-       WHERE work_area_id = $1::uuid AND worker_id = $2 AND work_date = $3`,
+       WHERE work_area_id::text = $1 AND worker_id = $2 AND work_date = $3`,
       [areaId, workerId, assignDate]
     );
 
