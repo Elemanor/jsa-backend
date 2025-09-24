@@ -3203,6 +3203,53 @@ app.post('/api/photos/presigned-url', async (req, res) => {
   }
 });
 
+// Get photos for a work area by date range
+app.get('/api/work-areas/:id/photos', async (req, res) => {
+  const { id } = req.params;
+  const { start_date, end_date, date } = req.query;
+
+  try {
+    let query;
+    let params;
+
+    if (start_date && end_date) {
+      // Fetch by date range
+      query = `
+        SELECT * FROM area_photos
+        WHERE work_area_id = $1
+        AND DATE(taken_at) >= $2
+        AND DATE(taken_at) <= $3
+        ORDER BY taken_at DESC
+      `;
+      params = [id, start_date, end_date];
+    } else if (date) {
+      // Fetch by specific date
+      query = `
+        SELECT * FROM area_photos
+        WHERE work_area_id = $1
+        AND DATE(taken_at) = $2
+        ORDER BY taken_at DESC
+      `;
+      params = [id, date];
+    } else {
+      // Fetch all photos for work area
+      query = `
+        SELECT * FROM area_photos
+        WHERE work_area_id = $1
+        ORDER BY taken_at DESC
+        LIMIT 100
+      `;
+      params = [id];
+    }
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching work area photos:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Get presigned URL for direct upload from browser
 app.post('/api/work-areas/:id/photos/presigned-url', async (req, res) => {
   const { id } = req.params;
