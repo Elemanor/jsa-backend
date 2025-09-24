@@ -3247,16 +3247,26 @@ app.post('/api/work-areas/:id/photos', async (req, res) => {
     if (req.body.photo && req.body.photo.startsWith('data:')) {
       // Handle base64 image data
       try {
-        const base64Data = req.body.photo.replace(/^data:image\/\w+;base64,/, '');
-        const buffer = Buffer.from(base64Data, 'base64');
+        // Check if AWS credentials are configured
+        if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+          const base64Data = req.body.photo.replace(/^data:image\/\w+;base64,/, '');
+          const buffer = Buffer.from(base64Data, 'base64');
 
-        // Upload to S3
-        const s3Result = await uploadToS3(buffer, 'photo.jpg', 'image/jpeg', `work-areas/${id}`);
-        photoUrl = s3Result.fileUrl;
-        thumbnailUrl = s3Result.fileUrl;
+          // Upload to S3
+          const s3Result = await uploadToS3(buffer, 'photo.jpg', 'image/jpeg', `work-areas/${id}`);
+          photoUrl = s3Result.fileUrl;
+          thumbnailUrl = s3Result.fileUrl;
+        } else {
+          // No S3 configured - store as base64 data URL
+          console.log('S3 not configured, storing photo as base64 data URL');
+          photoUrl = req.body.photo;  // Keep the full base64 data URL
+          thumbnailUrl = req.body.photo;
+        }
       } catch (uploadError) {
-        console.error('Error uploading to S3:', uploadError);
-        return res.status(500).json({ error: 'Failed to upload photo' });
+        console.error('Error uploading to S3, falling back to base64:', uploadError);
+        // Fallback to storing as base64 data URL
+        photoUrl = req.body.photo;
+        thumbnailUrl = req.body.photo;
       }
 
       caption = req.body.caption || `Photo from ${req.body.date || new Date().toISOString().split('T')[0]}`;
