@@ -6291,43 +6291,7 @@ app.delete('/api/daily-tasks/:taskId', async (req, res) => {
   }
 });
 
-// Worker assignment endpoints
-app.get('/api/work-areas/:workAreaId/workers', async (req, res) => {
-  const { workAreaId } = req.params;
-  const { date } = req.query;
-
-  try {
-    const result = await pool.query(
-      `SELECT DISTINCT
-        waw.worker_id,
-        waw.worker_name,
-        u.name as user_name,
-        waw.assigned_at,
-        ws.signin_time,
-        ws.signout_time,
-        ws.signin_date,
-        waw.id as assignment_id,
-        CASE
-          WHEN ws.signout_time IS NOT NULL THEN
-            EXTRACT(EPOCH FROM (ws.signout_time - ws.signin_time)) / 3600
-          ELSE NULL
-        END as hours_worked
-       FROM work_area_workers waw
-       LEFT JOIN users u ON u.id = waw.worker_id
-       LEFT JOIN worker_signins ws ON (
-         ws.worker_name = waw.worker_name
-         OR ws.worker_name = u.name
-       ) AND ws.signin_date = waw.work_date
-       WHERE waw.work_area_id = $1 AND waw.work_date = $2
-       ORDER BY COALESCE(waw.worker_name, u.name)`,
-      [workAreaId, date]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching assigned workers:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
+// REMOVED DUPLICATE - Using the endpoint at line 3552 instead
 
 // Test endpoint to check database connectivity
 app.get('/api/test-db', async (req, res) => {
