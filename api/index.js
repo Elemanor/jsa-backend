@@ -6490,6 +6490,28 @@ app.delete('/api/work-areas/:workAreaId/workers/:workerId', async (req, res) => 
   }
 });
 
+// Delete a photo
+app.delete('/api/work-areas/:workAreaId/photos/:photoId', async (req, res) => {
+  const { workAreaId, photoId } = req.params;
+
+  try {
+    const result = await pool.query(
+      'DELETE FROM area_photos WHERE id = $1 AND work_area_id::text = $2 RETURNING *',
+      [photoId, workAreaId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Photo not found' });
+    }
+
+    console.log(`Deleted photo ${photoId} from work area ${workAreaId}`);
+    res.json({ success: true, deleted: result.rows[0] });
+  } catch (err) {
+    console.error('Error deleting photo:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Get photos for work area with flexible date filtering
 app.get('/api/work-areas/:workAreaId/photos', async (req, res) => {
   const { workAreaId } = req.params;
