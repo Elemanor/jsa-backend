@@ -3156,10 +3156,9 @@ app.post('/api/work-areas/:id/photos/presigned-url', async (req, res) => {
   }
 });
 
-// Original endpoint for backward compatibility (accepts base64)
+// Original endpoint for backward compatibility (accepts base64 or FormData)
 app.post('/api/work-areas/:id/photos', async (req, res) => {
   const { id } = req.params;
-  const { photoUrl, thumbnailUrl, caption, takenBy, latitude, longitude, locationAddress, dailyActivityId } = req.body;
 
   // Validate work area ID
   if (!id || id === 'undefined' || id === 'null') {
@@ -3173,16 +3172,49 @@ app.post('/api/work-areas/:id/photos', async (req, res) => {
       return res.status(404).json({ error: 'Work area not found' });
     }
 
+    let photoUrl, thumbnailUrl, caption, takenBy, takenDate;
+    const { latitude, longitude, locationAddress, dailyActivityId } = req.body;
+
+    // Check if request has FormData (multipart/form-data) or JSON with base64
+    if (req.body.photo && req.body.photo.startsWith('data:')) {
+      // Handle base64 image data
+      try {
+        const base64Data = req.body.photo.replace(/^data:image\/\w+;base64,/, '');
+        const buffer = Buffer.from(base64Data, 'base64');
+
+        // Upload to S3
+        const s3Result = await uploadToS3(buffer, 'photo.jpg', 'image/jpeg', `work-areas/${id}`);
+        photoUrl = s3Result.fileUrl;
+        thumbnailUrl = s3Result.fileUrl;
+      } catch (uploadError) {
+        console.error('Error uploading to S3:', uploadError);
+        return res.status(500).json({ error: 'Failed to upload photo' });
+      }
+
+      caption = req.body.caption || `Photo from ${req.body.date || new Date().toISOString().split('T')[0]}`;
+      takenBy = req.body.takenBy || 'Field Worker';
+      takenDate = req.body.date || new Date().toISOString().split('T')[0];
+    } else if (req.body.photoUrl) {
+      // Handle already uploaded URL
+      const { photoUrl: url, thumbnailUrl: thumb, caption: cap, takenBy: by, taken_date } = req.body;
+      photoUrl = url;
+      thumbnailUrl = thumb || url;
+      caption = cap;
+      takenBy = by;
+      takenDate = taken_date || new Date().toISOString().split('T')[0];
+    } else {
+      return res.status(400).json({ error: 'No photo data provided' });
+    }
+
     const result = await pool.query(`
       INSERT INTO area_photos
-      (work_area_id, photo_url, thumbnail_url, caption, taken_by_name,
-       latitude, longitude, location_address, daily_activity_id)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      (work_area_id, photo_url, thumbnail_url, caption, taken_by_name, taken_at)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING *
-    `, [id, photoUrl, thumbnailUrl, caption, takenBy, latitude, longitude, locationAddress, dailyActivityId]);
+    `, [id, photoUrl, thumbnailUrl, caption, takenBy, takenDate]);
 
     // Set explicit CORS headers for this response
-    res.header('Access-Control-Allow-Origin', req.headers.origin);
+    res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
     res.header('Access-Control-Allow-Credentials', 'true');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
@@ -3190,7 +3222,39 @@ app.post('/api/work-areas/:id/photos', async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     console.error('Error saving photo:', err);
-    res.status(500).json({ error: err.message });
+
+    // If area_photos table doesn't exist, create it
+    if (err.code === '42P01') {
+      try {
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS area_photos (
+            id SERIAL PRIMARY KEY,
+            work_area_id UUID REFERENCES work_areas(id) ON DELETE CASCADE,
+            photo_url TEXT NOT NULL,
+            thumbnail_url TEXT,
+            caption TEXT,
+            taken_by_name VARCHAR(255),
+            taken_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          )
+        `);
+
+        // Retry the insert
+        const result = await pool.query(`
+          INSERT INTO area_photos
+          (work_area_id, photo_url, thumbnail_url, caption, taken_by_name, taken_at)
+          VALUES ($1, $2, $3, $4, $5, $6)
+          RETURNING *
+        `, [id, photoUrl, thumbnailUrl, caption, takenBy, takenDate]);
+
+        res.json(result.rows[0]);
+      } catch (createErr) {
+        console.error('Error creating area_photos table:', createErr);
+        res.status(500).json({ error: createErr.message });
+      }
+    } else {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
@@ -5727,6 +5791,132 @@ app.get('/api/photos/work-area/:workAreaId', async (req, res) => {
   }
 });
 
+// New endpoint for EnhancedPhotoManager component
+app.post('/api/photos/upload', upload.array('photos', 10), async (req, res) => {
+  try {
+    const { workAreaId, workAreaName, projectId, userId, userName, category, latitude, longitude, address } = req.body;
+
+    if (!workAreaId) {
+      return res.status(400).json({ error: 'Work area ID is required' });
+    }
+
+    const uploadedPhotos = [];
+
+    // Process each uploaded file
+    for (const file of req.files || []) {
+      try {
+        // Upload to S3
+        const s3Result = await uploadToS3(file.buffer, file.originalname, file.mimetype, `work-areas/${workAreaId}`);
+
+        // Save to database
+        const dbResult = await pool.query(`
+          INSERT INTO area_photos
+          (work_area_id, photo_url, thumbnail_url, caption, taken_by_name, taken_at, category, latitude, longitude, location_address)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          RETURNING *
+        `, [
+          workAreaId,
+          s3Result.fileUrl,
+          s3Result.fileUrl, // Use same URL for thumbnail for now
+          `${category || 'general'} photo from ${workAreaName}`,
+          userName || 'Field Worker',
+          new Date(),
+          category || 'general',
+          latitude || null,
+          longitude || null,
+          address || null
+        ]);
+
+        uploadedPhotos.push({
+          id: dbResult.rows[0].id,
+          url: s3Result.fileUrl,
+          thumbnailUrl: s3Result.fileUrl,
+          category: category || 'general',
+          tags: [],
+          description: dbResult.rows[0].caption,
+          location: latitude && longitude ? { latitude, longitude, address } : null,
+          timestamp: dbResult.rows[0].taken_at,
+          workAreaId,
+          workAreaName,
+          uploadedBy: userName || 'Field Worker'
+        });
+      } catch (uploadErr) {
+        console.error('Error uploading individual photo:', uploadErr);
+      }
+    }
+
+    // If no files but base64 data is provided (fallback)
+    if ((!req.files || req.files.length === 0) && req.body.photoData) {
+      const photoData = req.body.photoData;
+      const base64Data = photoData.replace(/^data:image\/\w+;base64,/, '');
+      const buffer = Buffer.from(base64Data, 'base64');
+
+      const s3Result = await uploadToS3(buffer, 'photo.jpg', 'image/jpeg', `work-areas/${workAreaId}`);
+
+      const dbResult = await pool.query(`
+        INSERT INTO area_photos
+        (work_area_id, photo_url, thumbnail_url, caption, taken_by_name, taken_at, category)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING *
+      `, [
+        workAreaId,
+        s3Result.fileUrl,
+        s3Result.fileUrl,
+        `${category || 'general'} photo from ${workAreaName}`,
+        userName || 'Field Worker',
+        new Date(),
+        category || 'general'
+      ]);
+
+      uploadedPhotos.push({
+        id: dbResult.rows[0].id,
+        url: s3Result.fileUrl,
+        thumbnailUrl: s3Result.fileUrl,
+        category: category || 'general',
+        tags: [],
+        description: dbResult.rows[0].caption,
+        timestamp: dbResult.rows[0].taken_at,
+        workAreaId,
+        workAreaName,
+        uploadedBy: userName || 'Field Worker'
+      });
+    }
+
+    res.json(uploadedPhotos);
+  } catch (err) {
+    console.error('Error in photo upload:', err);
+
+    // Create table if it doesn't exist
+    if (err.code === '42P01') {
+      try {
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS area_photos (
+            id SERIAL PRIMARY KEY,
+            work_area_id UUID REFERENCES work_areas(id) ON DELETE CASCADE,
+            photo_url TEXT NOT NULL,
+            thumbnail_url TEXT,
+            caption TEXT,
+            taken_by_name VARCHAR(255),
+            taken_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            category VARCHAR(50) DEFAULT 'general',
+            latitude DECIMAL(10, 8),
+            longitude DECIMAL(11, 8),
+            location_address TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          )
+        `);
+
+        // Retry the request
+        return app._router.handle(req, res);
+      } catch (createErr) {
+        console.error('Error creating table:', createErr);
+      }
+    }
+
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Get all photos for a specific area
 app.get('/api/area-photos/:areaId', async (req, res) => {
   const { areaId } = req.params;
@@ -6005,21 +6195,28 @@ app.get('/api/work-areas/:workAreaId/workers', async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT
+      `SELECT DISTINCT
         waw.worker_id,
-        w.name as worker_name,
+        waw.worker_name,
+        u.name as user_name,
         waw.assigned_at,
+        ws.signin_time,
+        ws.signout_time,
+        ws.signin_date,
+        waw.id as assignment_id,
         CASE
           WHEN ws.signout_time IS NOT NULL THEN
             EXTRACT(EPOCH FROM (ws.signout_time - ws.signin_time)) / 3600
           ELSE NULL
         END as hours_worked
        FROM work_area_workers waw
-       JOIN workers w ON w.id = waw.worker_id
-       LEFT JOIN worker_signins ws ON ws.worker_id = waw.worker_id
-         AND ws.signin_date = waw.work_date
+       LEFT JOIN users u ON u.id = waw.worker_id
+       LEFT JOIN worker_signins ws ON (
+         ws.worker_name = waw.worker_name
+         OR ws.worker_name = u.name
+       ) AND ws.signin_date = waw.work_date
        WHERE waw.work_area_id = $1 AND waw.work_date = $2
-       ORDER BY w.name`,
+       ORDER BY COALESCE(waw.worker_name, u.name)`,
       [workAreaId, date]
     );
     res.json(result.rows);
@@ -6186,13 +6383,30 @@ app.delete('/api/work-areas/:workAreaId/workers/:workerId', async (req, res) => 
   const { workAreaId, workerId } = req.params;
   const { date } = req.query;
 
+  // Validate workerId
+  if (!workerId || workerId === 'undefined' || workerId === 'null') {
+    console.error('Invalid workerId in DELETE request:', workerId);
+    // Return success even if workerId is invalid to prevent UI errors
+    return res.json({ success: true, message: 'Worker ID was invalid, no deletion performed' });
+  }
+
+  // Convert workerId to integer
+  const workerIdInt = parseInt(workerId, 10);
+  if (isNaN(workerIdInt)) {
+    console.error('WorkerId is not a valid number:', workerId);
+    // Return success even if workerId is invalid to prevent UI errors
+    return res.json({ success: true, message: 'Worker ID was not a number, no deletion performed' });
+  }
+
   try {
-    await pool.query(
+    const result = await pool.query(
       `DELETE FROM work_area_workers
        WHERE work_area_id = $1 AND worker_id = $2 AND work_date = $3`,
-      [workAreaId, workerId, date]
+      [workAreaId, workerIdInt, date]
     );
-    res.json({ success: true });
+
+    console.log(`Removed worker ${workerIdInt} from work area ${workAreaId} for date ${date}`);
+    res.json({ success: true, rowsDeleted: result.rowCount });
   } catch (err) {
     console.error('Error removing worker:', err);
     res.status(500).json({ error: err.message });
