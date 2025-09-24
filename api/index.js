@@ -3208,6 +3208,8 @@ app.get('/api/work-areas/:id/photos', async (req, res) => {
   const { id } = req.params;
   const { start_date, end_date, date } = req.query;
 
+  console.log('Fetching photos for work area:', id, { start_date, end_date, date });
+
   try {
     let query;
     let params;
@@ -3243,6 +3245,13 @@ app.get('/api/work-areas/:id/photos', async (req, res) => {
     }
 
     const result = await pool.query(query, params);
+    console.log(`Found ${result.rows.length} photos for work area ${id}`);
+
+    // Log first photo date if any
+    if (result.rows.length > 0) {
+      console.log('First photo taken_at:', result.rows[0].taken_at);
+    }
+
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching work area photos:', err);
@@ -3305,7 +3314,12 @@ app.post('/api/work-areas/:id/photos', async (req, res) => {
 
       caption = req.body.caption || `Photo from ${req.body.date || new Date().toISOString().split('T')[0]}`;
       takenBy = req.body.takenBy || 'Field Worker';
-      takenDate = req.body.date || new Date().toISOString().split('T')[0];
+      // Convert date string to proper timestamp
+      if (req.body.date) {
+        takenDate = new Date(req.body.date + 'T12:00:00Z').toISOString();
+      } else {
+        takenDate = new Date().toISOString();
+      }
     } else if (req.body.photoUrl) {
       // Handle already uploaded URL
       const { photoUrl: url, thumbnailUrl: thumb, caption: cap, takenBy: by, taken_date } = req.body;
@@ -3324,6 +3338,13 @@ app.post('/api/work-areas/:id/photos', async (req, res) => {
       VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING *
     `, [id, photoUrl, thumbnailUrl, caption, takenBy, takenDate]);
+
+    console.log('Photo saved successfully:', {
+      id: result.rows[0].id,
+      work_area_id: result.rows[0].work_area_id,
+      taken_at: result.rows[0].taken_at,
+      photo_url: photoUrl.substring(0, 50) + '...'
+    });
 
     // Set explicit CORS headers for this response
     res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
