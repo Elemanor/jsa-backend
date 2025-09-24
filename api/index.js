@@ -51,6 +51,60 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Setup work_area_workers table endpoint
+app.get('/api/setup-worker-table', async (req, res) => {
+  try {
+    // Create the table
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS work_area_workers (
+        id SERIAL PRIMARY KEY,
+        work_area_id UUID NOT NULL REFERENCES work_areas(id) ON DELETE CASCADE,
+        worker_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        work_date DATE DEFAULT CURRENT_DATE,
+        worker_name VARCHAR(255),
+        assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        hours_worked DECIMAL(4,2),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create indexes
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_work_area_workers_area_id
+      ON work_area_workers(work_area_id)
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_work_area_workers_worker_id
+      ON work_area_workers(worker_id)
+    `);
+
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_work_area_workers_date
+      ON work_area_workers(work_date)
+    `);
+
+    // Create unique constraint
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS unique_work_area_worker_date
+      ON work_area_workers(work_area_id, worker_id, work_date)
+    `);
+
+    // Test the table
+    const test = await pool.query('SELECT COUNT(*) FROM work_area_workers');
+
+    res.json({
+      success: true,
+      message: 'Work area workers table setup complete',
+      currentRows: test.rows[0].count
+    });
+  } catch (err) {
+    console.error('Error setting up worker table:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Update Romeu Morim to foreman
 app.get('/api/update-romeu-foreman', async (req, res) => {
   try {
