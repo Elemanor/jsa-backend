@@ -3203,93 +3203,8 @@ app.post('/api/photos/presigned-url', async (req, res) => {
   }
 });
 
-// Get photos for a work area by date range
-app.get('/api/work-areas/:id/photos', async (req, res) => {
-  const { id } = req.params;
-  const { start_date, end_date, date, all } = req.query;
-
-  console.log('Fetching photos for work area:', id, { start_date, end_date, date, all });
-
-  try {
-    // First check if the table exists and has any photos
-    const checkQuery = await pool.query(
-      `SELECT COUNT(*) as total FROM area_photos WHERE work_area_id = $1`,
-      [id]
-    );
-    console.log(`Total photos for work area ${id}: ${checkQuery.rows[0].total}`);
-
-    let query;
-    let params;
-
-    // If 'all' parameter is set, return all photos (for debugging)
-    if (all === 'true') {
-      query = `
-        SELECT * FROM area_photos
-        WHERE work_area_id = $1
-        ORDER BY taken_at DESC NULLS LAST, created_at DESC
-      `;
-      params = [id];
-    } else if (start_date && end_date) {
-      // Fetch by date range - also check created_at as fallback
-      query = `
-        SELECT * FROM area_photos
-        WHERE work_area_id = $1
-        AND (
-          (taken_at IS NOT NULL AND DATE(taken_at) >= $2 AND DATE(taken_at) <= $3)
-          OR (taken_at IS NULL AND DATE(created_at) >= $2 AND DATE(created_at) <= $3)
-        )
-        ORDER BY COALESCE(taken_at, created_at) DESC
-      `;
-      params = [id, start_date, end_date];
-    } else if (date) {
-      // Fetch by specific date
-      query = `
-        SELECT * FROM area_photos
-        WHERE work_area_id = $1
-        AND (
-          (taken_at IS NOT NULL AND DATE(taken_at) = $2)
-          OR (taken_at IS NULL AND DATE(created_at) = $2)
-        )
-        ORDER BY COALESCE(taken_at, created_at) DESC
-      `;
-      params = [id, date];
-    } else {
-      // Fetch all photos for work area
-      query = `
-        SELECT * FROM area_photos
-        WHERE work_area_id = $1
-        ORDER BY COALESCE(taken_at, created_at) DESC
-        LIMIT 100
-      `;
-      params = [id];
-    }
-
-    const result = await pool.query(query, params);
-    console.log(`Query returned ${result.rows.length} photos for work area ${id}`);
-
-    // Log first photo details if any
-    if (result.rows.length > 0) {
-      console.log('First photo details:', {
-        id: result.rows[0].id,
-        taken_at: result.rows[0].taken_at,
-        created_at: result.rows[0].created_at,
-        caption: result.rows[0].caption
-      });
-    }
-
-    res.json(result.rows);
-  } catch (err) {
-    console.error('Error fetching work area photos:', err);
-
-    // Check if table exists
-    if (err.code === '42P01') {
-      console.log('area_photos table does not exist');
-      return res.json([]);
-    }
-
-    res.status(500).json({ error: err.message });
-  }
-});
+// REMOVED DUPLICATE - Using the endpoint at line 6605 instead
+// This was causing conflicts with the other photo endpoint
 
 // Get presigned URL for direct upload from browser
 app.post('/api/work-areas/:id/photos/presigned-url', async (req, res) => {
@@ -6601,7 +6516,48 @@ app.delete('/api/work-areas/:workAreaId/workers/:workerId', async (req, res) => 
   }
 });
 
-// Duplicate endpoint removed - using the comprehensive one at line 3207 instead
+// Get photos for work area with flexible date filtering
+app.get('/api/work-areas/:workAreaId/photos', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { date, start_date, end_date, all } = req.query;
+
+  console.log('Photo fetch request:', { workAreaId, date, start_date, end_date, all });
+
+  try {
+    let query;
+    let params = [workAreaId];
+
+    if (all === 'true') {
+      // Return all photos for debugging
+      query = `SELECT * FROM area_photos WHERE work_area_id = $1 ORDER BY taken_at DESC`;
+    } else if (start_date && end_date) {
+      // Date range query
+      query = `SELECT * FROM area_photos
+               WHERE work_area_id = $1
+               AND DATE(taken_at) >= $2
+               AND DATE(taken_at) <= $3
+               ORDER BY taken_at DESC`;
+      params.push(start_date, end_date);
+    } else if (date) {
+      // Single date query
+      query = `SELECT * FROM area_photos
+               WHERE work_area_id = $1
+               AND DATE(taken_at) = $2
+               ORDER BY taken_at DESC`;
+      params.push(date);
+    } else {
+      // Default: return all photos
+      query = `SELECT * FROM area_photos WHERE work_area_id = $1 ORDER BY taken_at DESC LIMIT 100`;
+    }
+
+    const result = await pool.query(query, params);
+    console.log(`Returning ${result.rows.length} photos for work area ${workAreaId}`);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching photos:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Export for Vercel
 module.exports = app;
