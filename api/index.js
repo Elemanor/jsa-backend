@@ -6559,5 +6559,14 @@ app.get('/api/work-areas/:workAreaId/photos', async (req, res) => {
   }
 });
 
+// Test endpoint for deployment verification
+app.get('/api/deployment-test', (req, res) => {
+  res.json({
+    deployed: true,
+    timestamp: new Date().toISOString(),
+    version: 'photo-fix-v3'
+  });
+});
+
 // Export for Vercel
 module.exports = app;
