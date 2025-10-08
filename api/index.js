@@ -1214,7 +1214,22 @@ app.get('/api/concrete-deliveries/:date', async (req, res) => {
     }
 
     const result = await pool.query(
-      'SELECT * FROM concrete_deliveries WHERE date = $1 ORDER BY time',
+      `SELECT
+        id,
+        date as delivery_date,
+        time as delivery_time,
+        project_id,
+        project_name,
+        area,
+        quantity,
+        concrete_type,
+        status,
+        actual_volume,
+        actual_hours,
+        supervisor
+       FROM concrete_deliveries
+       WHERE date = $1
+       ORDER BY time`,
       [date]
     );
     res.json(result.rows);
