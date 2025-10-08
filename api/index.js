@@ -533,9 +533,9 @@ app.post('/api/auth/login', async (req, res) => {
   });
 
   try {
-    // Try case-insensitive name match
+    // Try case-insensitive name match - include display_name
     const result = await pool.query(
-      'SELECT id, name, role FROM users WHERE LOWER(name) = LOWER($1) AND pin = $2',
+      'SELECT id, name, role, display_name FROM users WHERE LOWER(name) = LOWER($1) AND pin = $2',
       [name, pin]
     );
 
@@ -556,6 +556,8 @@ app.post('/api/auth/login', async (req, res) => {
       }
     } else {
       const user = result.rows[0];
+      // Add displayName field for frontend use
+      user.displayName = user.display_name || user.name;
       console.log('Login successful:', user);
 
       // If worker role, create automatic attendance record (with or without location)
@@ -633,22 +635,10 @@ app.post('/api/auth/register', upload.fields([
     const fullName = `${firstName} ${lastName}`;
     const registrationDate = new Date().toISOString();
 
-    console.log('New worker registration:', { fullName, language });
+    // Ensure PIN is set - use provided PIN or default to '1111'
+    const workerPin = pin && pin.trim() !== '' ? pin : '1111';
 
-    // Validate mandatory certificates
-    if (!req.files || !req.files.workingAtHeightsCert) {
-      return res.status(400).json({
-        error: 'Working at Heights certificate is required',
-        success: false
-      });
-    }
-
-    if (!req.files.whimisCert) {
-      return res.status(400).json({
-        error: 'WHMIS certificate is required',
-        success: false
-      });
-    }
+    console.log('New worker registration:', { fullName, language, pin: workerPin });
 
     // First, check if user already exists
     const existingUser = await pool.query(
@@ -740,7 +730,7 @@ app.post('/api/auth/register', upload.fields([
       // Insert into users table
       const userResult = await pool.query(
         'INSERT INTO users (name, pin, role) VALUES ($1, $2, $3) RETURNING id',
-        [fullName, pin, role || 'worker']
+        [fullName, workerPin, role || 'worker']
       );
 
       const userId = userResult.rows[0].id;
@@ -773,7 +763,8 @@ app.post('/api/auth/register', upload.fields([
         user: {
           id: userId,
           name: fullName,
-          role: role || 'worker'
+          role: role || 'worker',
+          pin: workerPin
         }
       });
 
@@ -1116,9 +1107,9 @@ app.post('/api/timesheets', async (req, res) => {
       calculatedTotalHours = Math.round((durationMinutes / 60) * 100) / 100;
     }
 
-    // Calculate regular and overtime hours
-    const regularHours = Math.min(calculatedTotalHours, 8);
-    const overtimeHours = Math.max(calculatedTotalHours - 8, 0);
+    // For now, just track total hours - overtime will be calculated weekly
+    const regularHours = calculatedTotalHours;
+    const overtimeHours = 0; // Overtime is calculated on weekly basis, not daily
 
     const result = await pool.query(
       'INSERT INTO timesheets (worker_id, worker_name, date, project_name, start_time, end_time, break_duration, total_hours, regular_hours, overtime_hours, notes, week_number) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *',
@@ -1825,7 +1816,14 @@ app.get('/api/timesheets', async (req, res) => {
       console.error('Error calculating hours:', err);
     });
 
-    let query = 'SELECT *, COALESCE(regular_hours, LEAST(total_hours, 8)) as regular_hours, COALESCE(overtime_hours, GREATEST(total_hours - 8, 0)) as overtime_hours FROM timesheets WHERE 1=1';
+    // First, get the raw timesheet data
+    let query = `
+      SELECT *,
+        total_hours as regular_hours,
+        0 as overtime_hours
+      FROM timesheets
+      WHERE 1=1
+    `;
     let params = [];
     let paramIndex = 1;
 
@@ -1859,7 +1857,61 @@ app.get('/api/timesheets', async (req, res) => {
     query += ' ORDER BY date DESC';
 
     const result = await pool.query(query, params);
-    res.json(result.rows);
+
+    // Calculate weekly overtime (after 44 hours per week)
+    const timesheets = result.rows;
+    const weeklyHours = {};
+
+    // Group timesheets by week and worker
+    timesheets.forEach(entry => {
+      const weekKey = `${entry.worker_name}-${entry.week_number}-${new Date(entry.date).getFullYear()}`;
+      if (!weeklyHours[weekKey]) {
+        weeklyHours[weekKey] = {
+          totalHours: 0,
+          entries: []
+        };
+      }
+      weeklyHours[weekKey].totalHours += parseFloat(entry.total_hours || 0);
+      weeklyHours[weekKey].entries.push(entry);
+    });
+
+    // Apply overtime calculation (44 hours per week threshold)
+    const processedTimesheets = timesheets.map(entry => {
+      const weekKey = `${entry.worker_name}-${entry.week_number}-${new Date(entry.date).getFullYear()}`;
+      const weekData = weeklyHours[weekKey];
+
+      // Calculate how much overtime this week has
+      const weeklyOvertime = Math.max(weekData.totalHours - 44, 0);
+
+      // For simplicity, show overtime only on entries that push the week over 44 hours
+      let entryOvertime = 0;
+      let cumulativeHours = 0;
+
+      // Find this entry's position in the week
+      const sortedEntries = weekData.entries.sort((a, b) => new Date(a.date) - new Date(b.date));
+      for (let e of sortedEntries) {
+        const prevCumulative = cumulativeHours;
+        cumulativeHours += parseFloat(e.total_hours || 0);
+
+        if (e.id === entry.id) {
+          // This is our entry - check if it crosses the 44-hour threshold
+          if (prevCumulative < 44 && cumulativeHours > 44) {
+            entryOvertime = cumulativeHours - 44;
+          } else if (prevCumulative >= 44) {
+            entryOvertime = parseFloat(e.total_hours || 0);
+          }
+          break;
+        }
+      }
+
+      return {
+        ...entry,
+        regular_hours: parseFloat(entry.total_hours || 0) - entryOvertime,
+        overtime_hours: entryOvertime
+      };
+    });
+
+    res.json(processedTimesheets);
   } catch (err) {
     console.error('Error fetching timesheets:', err);
     res.status(500).json({ error: err.message });
@@ -2829,6 +2881,53 @@ app.post('/api/add-missing-users', async (req, res) => {
   }
 });
 
+// Add David Peniche and Romeo Duarte as foremen
+app.post('/api/add-new-foremen', async (req, res) => {
+  try {
+    const foremen = [
+      { name: 'David Peniche', email: 'david.peniche@mjr.com', pin: '1111', role: 'foreman' },
+      { name: 'Romeo Duarte', email: 'romeo.duarte@mjr.com', pin: '1111', role: 'foreman' }
+    ];
+
+    const results = [];
+    for (const foreman of foremen) {
+      try {
+        const result = await pool.query(
+          `INSERT INTO users (name, email, pin, role) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (email) DO UPDATE
+           SET name = EXCLUDED.name, pin = EXCLUDED.pin, role = EXCLUDED.role
+           RETURNING *`,
+          [foreman.name, foreman.email, foreman.pin, foreman.role]
+        );
+        results.push({
+          action: 'added',
+          user: result.rows[0]
+        });
+      } catch (userErr) {
+        results.push({
+          action: 'error',
+          user: foreman.name,
+          error: userErr.message
+        });
+      }
+    }
+
+    const verifyResult = await pool.query(
+      "SELECT id, name, email, role FROM users WHERE name IN ('David Peniche', 'Romeo Duarte') ORDER BY name"
+    );
+
+    res.json({
+      success: true,
+      message: 'Foremen added successfully',
+      results: results,
+      foremen: verifyResult.rows
+    });
+  } catch (err) {
+    console.error('Error adding foremen:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ============================================
 // WORK AREAS MANAGEMENT ENDPOINTS
 // ============================================
@@ -2987,12 +3086,34 @@ app.post('/api/work-areas', async (req, res) => {
       ADD COLUMN IF NOT EXISTS foreman_in_charge VARCHAR(255)
     `).catch(() => {});
 
-    const result = await pool.query(`
-      INSERT INTO work_areas
-      (name, description, location, start_date, current_stage, status, project_id, planned_concrete_volume, foreman_in_charge)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-      RETURNING *
-    `, [name, description, location, startDate, currentStage || 'initial_layout', status || 'active', projectId, plannedConcreteVolume || 0, foremanInCharge || 'N/A']);
+    // Check if planned_concrete_volume column exists
+    const columnCheck = await pool.query(`
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = 'work_areas'
+      AND column_name = 'planned_concrete_volume'
+    `);
+
+    const hasPlannedVolume = columnCheck.rows.length > 0;
+
+    let result;
+    if (hasPlannedVolume) {
+      // Include planned_concrete_volume if column exists
+      result = await pool.query(`
+        INSERT INTO work_areas
+        (name, description, location, start_date, current_stage, status, project_id, planned_concrete_volume, foreman_in_charge)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING *
+      `, [name, description, location, startDate, currentStage || 'initial_layout', status || 'active', projectId, plannedConcreteVolume || 0, foremanInCharge || 'N/A']);
+    } else {
+      // Exclude planned_concrete_volume if column doesn't exist
+      result = await pool.query(`
+        INSERT INTO work_areas
+        (name, description, location, start_date, current_stage, status, project_id, foreman_in_charge)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING *
+      `, [name, description, location, startDate, currentStage || 'initial_layout', status || 'active', projectId, foremanInCharge || 'N/A']);
+    }
 
     res.json(result.rows[0]);
   } catch (err) {
@@ -3224,8 +3345,8 @@ app.post('/api/work-areas/:id/photos/presigned-url', async (req, res) => {
   }
 });
 
-// Original endpoint for backward compatibility (accepts base64 or FormData)
-app.post('/api/work-areas/:id/photos', async (req, res) => {
+// Original endpoint for backward compatibility (accepts base64, JSON, or FormData)
+app.post('/api/work-areas/:id/photos', upload.single('photo'), async (req, res) => {
   const { id } = req.params;
 
   // Validate work area ID
@@ -3243,8 +3364,37 @@ app.post('/api/work-areas/:id/photos', async (req, res) => {
     let photoUrl, thumbnailUrl, caption, takenBy, takenDate;
     const { latitude, longitude, locationAddress, dailyActivityId } = req.body;
 
-    // Check if request has FormData (multipart/form-data) or JSON with base64
-    if (req.body.photo && req.body.photo.startsWith('data:')) {
+    // Check if request has file upload (multipart/form-data)
+    if (req.file) {
+      // Handle file upload via multer
+      try {
+        if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+          // Upload to S3
+          const s3Result = await uploadToS3(
+            req.file.buffer,
+            req.file.originalname,
+            req.file.mimetype,
+            `work-areas/${id}`
+          );
+          photoUrl = s3Result.fileUrl;
+          thumbnailUrl = s3Result.fileUrl;
+        } else {
+          // Convert to base64 if S3 not configured
+          const base64 = req.file.buffer.toString('base64');
+          photoUrl = `data:${req.file.mimetype};base64,${base64}`;
+          thumbnailUrl = photoUrl;
+        }
+      } catch (uploadError) {
+        console.error('Error handling file upload:', uploadError);
+        return res.status(500).json({ error: 'Failed to process uploaded file' });
+      }
+
+      caption = req.body.caption || `Work area photo - ${new Date().toLocaleDateString()}`;
+      takenBy = req.body.taken_by_name || 'Field Worker';
+      takenDate = req.body.taken_at || new Date().toISOString();
+    }
+    // Check if request has base64 data
+    else if (req.body.photo && req.body.photo.startsWith('data:')) {
       // Handle base64 image data
       try {
         // Check if AWS credentials are configured
@@ -3277,17 +3427,39 @@ app.post('/api/work-areas/:id/photos', async (req, res) => {
       } else {
         takenDate = new Date().toISOString();
       }
-    } else if (req.body.photoUrl) {
-      // Handle already uploaded URL
-      const { photoUrl: url, thumbnailUrl: thumb, caption: cap, takenBy: by, taken_date } = req.body;
-      photoUrl = url;
-      thumbnailUrl = thumb || url;
-      caption = cap;
-      takenBy = by;
-      takenDate = taken_date || new Date().toISOString().split('T')[0];
+    } else if (req.body.photoUrl || req.body.photo_url) {
+      // Handle already uploaded URL (support both camelCase and snake_case)
+      const {
+        photoUrl: pUrl,
+        photo_url,
+        thumbnailUrl: tUrl,
+        thumbnail_url,
+        caption: cap,
+        takenBy: by,
+        taken_by_name,
+        taken_date,
+        taken_at
+      } = req.body;
+
+      photoUrl = pUrl || photo_url;
+      thumbnailUrl = tUrl || thumbnail_url || photoUrl;
+      caption = cap || `Work area photo - ${new Date().toLocaleDateString()}`;
+      takenBy = by || taken_by_name || 'Field Worker';
+      takenDate = taken_date || taken_at || new Date().toISOString();
     } else {
-      return res.status(400).json({ error: 'No photo data provided' });
+      console.error('No photo data provided in request body:', Object.keys(req.body));
+      return res.status(400).json({ error: 'No photo data provided', receivedFields: Object.keys(req.body) });
     }
+
+    // Log the data we're about to insert
+    console.log('Attempting to insert photo with data:', {
+      work_area_id: id,
+      photo_url: photoUrl ? photoUrl.substring(0, 100) + '...' : 'null',
+      thumbnail_url: thumbnailUrl ? thumbnailUrl.substring(0, 100) + '...' : 'null',
+      caption: caption,
+      taken_by_name: takenBy,
+      taken_at: takenDate
+    });
 
     const result = await pool.query(`
       INSERT INTO area_photos
@@ -3312,6 +3484,13 @@ app.post('/api/work-areas/:id/photos', async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     console.error('Error saving photo:', err);
+    console.error('Error details:', {
+      code: err.code,
+      message: err.message,
+      detail: err.detail,
+      table: err.table,
+      column: err.column
+    });
 
     // If area_photos table doesn't exist, create it
     if (err.code === '42P01') {
@@ -3343,7 +3522,20 @@ app.post('/api/work-areas/:id/photos', async (req, res) => {
         res.status(500).json({ error: createErr.message });
       }
     } else {
-      res.status(500).json({ error: err.message });
+      // Return more detailed error information
+      res.status(500).json({
+        error: err.message,
+        code: err.code,
+        detail: err.detail || 'Database error occurred',
+        hint: err.hint || 'Check if the photo_url and caption are not too long',
+        requestData: {
+          work_area_id: id,
+          hasPhotoUrl: !!photoUrl,
+          hasThumbnailUrl: !!thumbnailUrl,
+          caption: caption,
+          takenBy: takenBy
+        }
+      });
     }
   }
 });
@@ -4806,7 +4998,7 @@ app.put('/api/material-requests/mark-viewed', async (req, res) => {
   }
 });
 
-app.post('/api/material-requests', async (req, res) => {
+app.post('/api/material-requests', upload.array('photos', 5), async (req, res) => {
   const {
     worker_id,
     worker_name,
@@ -4819,7 +5011,7 @@ app.post('/api/material-requests', async (req, res) => {
   } = req.body;
 
   try {
-    // Ensure table exists
+    // Ensure table exists with photo_urls column
     await pool.query(`
       CREATE TABLE IF NOT EXISTS material_requests (
         id SERIAL PRIMARY KEY,
@@ -4831,6 +5023,7 @@ app.post('/api/material-requests', async (req, res) => {
         urgency VARCHAR(20),
         delivery_date DATE,
         notes TEXT,
+        photo_urls TEXT[],
         status VARCHAR(50) DEFAULT 'pending',
         submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP,
@@ -4839,12 +5032,31 @@ app.post('/api/material-requests', async (req, res) => {
       )
     `);
 
+    // Add photo_urls column if it doesn't exist
+    await pool.query(`
+      ALTER TABLE material_requests
+      ADD COLUMN IF NOT EXISTS photo_urls TEXT[]
+    `);
+
+    // Upload photos to S3 if provided
+    let photoUrls = [];
+    if (req.files && req.files.length > 0) {
+      const uploadPromises = req.files.map(file =>
+        uploadToS3(file.buffer, file.originalname, file.mimetype, 'material-requests')
+      );
+      const uploadResults = await Promise.all(uploadPromises);
+      photoUrls = uploadResults.map(result => result.fileUrl);
+    }
+
+    // Parse items if it's a string (from FormData)
+    const parsedItems = typeof items === 'string' ? JSON.parse(items) : items;
+
     const result = await pool.query(
       `INSERT INTO material_requests
-       (worker_id, worker_name, project_id, project_name, items, urgency, delivery_date, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       (worker_id, worker_name, project_id, project_name, items, urgency, delivery_date, notes, photo_urls)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
-      [worker_id, worker_name, project_id, project_name, JSON.stringify(items), urgency, delivery_date, notes]
+      [worker_id, worker_name, project_id, project_name, parsedItems, urgency, delivery_date, notes, photoUrls]
     );
 
     res.json(result.rows[0]);
@@ -4877,6 +5089,194 @@ app.patch('/api/material-requests/:id', async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     console.error('Error updating material request:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// MJR COMMUNITY FEED API ENDPOINTS
+// ============================================
+
+// Get all community feed posts with stats
+app.get('/api/community-feed', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        p.*,
+        COALESCE(l.like_count, 0) as like_count,
+        COALESCE(c.comment_count, 0) as comment_count,
+        COALESCE(ul.user_liked, false) as user_liked
+      FROM community_feed_posts p
+      LEFT JOIN (
+        SELECT post_id, COUNT(*) as like_count
+        FROM community_feed_likes
+        GROUP BY post_id
+      ) l ON p.id = l.post_id
+      LEFT JOIN (
+        SELECT post_id, COUNT(*) as comment_count
+        FROM community_feed_comments
+        GROUP BY post_id
+      ) c ON p.id = c.post_id
+      LEFT JOIN (
+        SELECT post_id, true as user_liked
+        FROM community_feed_likes
+        WHERE user_id = $1
+      ) ul ON p.id = ul.post_id
+      ORDER BY p.created_at DESC
+    `, [req.query.user_id || 0]);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching community feed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create a new feed post (manual post)
+app.post('/api/community-feed', upload.single('photo'), async (req, res) => {
+  try {
+    const { foreman_id, foreman_name, work_area_id, work_area_name, caption } = req.body;
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'Photo is required' });
+    }
+
+    // Upload photo to S3
+    const uploadResult = await uploadToS3(
+      req.file.buffer,
+      req.file.originalname,
+      req.file.mimetype,
+      'community-feed'
+    );
+
+    const result = await pool.query(`
+      INSERT INTO community_feed_posts
+      (foreman_id, foreman_name, work_area_id, work_area_name, photo_url, caption, post_type)
+      VALUES ($1, $2, $3, $4, $5, $6, 'manual')
+      RETURNING *
+    `, [foreman_id, foreman_name, work_area_id, work_area_name, uploadResult.fileUrl, caption]);
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error creating feed post:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Auto-create feed post from work area photo upload
+app.post('/api/community-feed/from-work-area', async (req, res) => {
+  try {
+    const { foreman_id, foreman_name, work_area_id, work_area_name, photo_url, task_id, caption } = req.body;
+
+    const result = await pool.query(`
+      INSERT INTO community_feed_posts
+      (foreman_id, foreman_name, work_area_id, work_area_name, photo_url, caption, post_type, task_id)
+      VALUES ($1, $2, $3, $4, $5, $6, 'work_area_progress', $7)
+      RETURNING *
+    `, [foreman_id, foreman_name, work_area_id, work_area_name, photo_url, caption, task_id]);
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error creating feed post from work area:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Like a post
+app.post('/api/community-feed/:postId/like', async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { user_id, user_name } = req.body;
+
+    const result = await pool.query(`
+      INSERT INTO community_feed_likes (post_id, user_id, user_name)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (post_id, user_id) DO NOTHING
+      RETURNING *
+    `, [postId, user_id, user_name]);
+
+    res.json(result.rows[0] || { message: 'Already liked' });
+  } catch (err) {
+    console.error('Error liking post:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Unlike a post
+app.delete('/api/community-feed/:postId/like', async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { user_id } = req.body;
+
+    const result = await pool.query(`
+      DELETE FROM community_feed_likes
+      WHERE post_id = $1 AND user_id = $2
+      RETURNING *
+    `, [postId, user_id]);
+
+    res.json(result.rows[0] || { message: 'Like not found' });
+  } catch (err) {
+    console.error('Error unliking post:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get comments for a post
+app.get('/api/community-feed/:postId/comments', async (req, res) => {
+  try {
+    const { postId } = req.params;
+
+    const result = await pool.query(`
+      SELECT * FROM community_feed_comments
+      WHERE post_id = $1
+      ORDER BY created_at ASC
+    `, [postId]);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching comments:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Add a comment to a post
+app.post('/api/community-feed/:postId/comments', async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const { user_id, user_name, comment_text } = req.body;
+
+    const result = await pool.query(`
+      INSERT INTO community_feed_comments (post_id, user_id, user_name, comment_text)
+      VALUES ($1, $2, $3, $4)
+      RETURNING *
+    `, [postId, user_id, user_name, comment_text]);
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error adding comment:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete a comment
+app.delete('/api/community-feed/comments/:commentId', async (req, res) => {
+  try {
+    const { commentId } = req.params;
+    const { user_id } = req.body;
+
+    const result = await pool.query(`
+      DELETE FROM community_feed_comments
+      WHERE id = $1 AND user_id = $2
+      RETURNING *
+    `, [commentId, user_id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Comment not found or unauthorized' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error deleting comment:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -6102,6 +6502,28 @@ app.post('/api/photos/upload', upload.array('photos', 10), async (req, res) => {
           workAreaName,
           uploadedBy: userName || 'Field Worker'
         });
+
+        // Auto-post to community feed if category is 'progress'
+        if (category === 'progress') {
+          try {
+            await pool.query(`
+              INSERT INTO community_feed_posts
+              (foreman_id, foreman_name, work_area_id, work_area_name, photo_url, caption, post_type)
+              VALUES ($1, $2, $3, $4, $5, $6, 'work_area_progress')
+            `, [
+              userId,
+              userName,
+              workAreaId,
+              workAreaName,
+              s3Result.fileUrl,
+              `Progress update from ${workAreaName}`
+            ]);
+            console.log('Auto-posted to community feed');
+          } catch (feedErr) {
+            console.error('Error posting to community feed:', feedErr);
+            // Don't fail the photo upload if feed posting fails
+          }
+        }
       } catch (uploadErr) {
         console.error('Error uploading individual photo:', uploadErr);
       }
@@ -6193,6 +6615,126 @@ app.get('/api/area-photos/:areaId', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching area photos:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Safety Procedures endpoints
+app.get('/api/safety-procedures', async (req, res) => {
+  const { project_id, work_area_id, category } = req.query;
+
+  try {
+    let query = `
+      SELECT * FROM safety_procedures
+      WHERE is_active = true
+    `;
+    const params = [];
+
+    if (project_id) {
+      params.push(project_id);
+      query += ` AND project_id = $${params.length}`;
+    }
+
+    if (work_area_id) {
+      params.push(work_area_id);
+      query += ` AND work_area_id = $${params.length}`;
+    }
+
+    if (category && category !== 'all') {
+      params.push(category);
+      query += ` AND category = $${params.length}`;
+    }
+
+    query += ` ORDER BY uploaded_at DESC`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching safety procedures:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get presigned URL for safety procedure upload
+app.post('/api/safety-procedures/presigned-url', async (req, res) => {
+  const { fileName, fileType } = req.body;
+
+  if (!fileName || !fileType) {
+    return res.status(400).json({ error: 'File name and type are required' });
+  }
+
+  if (fileType !== 'application/pdf') {
+    return res.status(400).json({ error: 'Only PDF files are allowed' });
+  }
+
+  try {
+    // Use the existing generatePresignedUrl function from s3-upload module
+    const result = await generatePresignedUrl(fileName, fileType, 'safety-procedures');
+    res.json(result);
+  } catch (err) {
+    console.error('Error generating presigned URL:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create safety procedure
+app.post('/api/safety-procedures', async (req, res) => {
+  const {
+    title,
+    description,
+    category,
+    file_url,
+    file_name,
+    file_size,
+    version,
+    tags,
+    project_id,
+    work_area_id,
+    uploaded_by
+  } = req.body;
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO safety_procedures (
+        title, description, category, file_url, file_name,
+        file_size, version, tags, project_id, work_area_id,
+        uploaded_by, is_active
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true)
+      RETURNING *`,
+      [
+        title, description, category, file_url, file_name,
+        file_size, version, tags, project_id, work_area_id,
+        uploaded_by || 'Foreman'
+      ]
+    );
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error creating safety procedure:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete safety procedure
+app.delete('/api/safety-procedures/:id', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const result = await pool.query(
+      `UPDATE safety_procedures
+       SET is_active = false, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1
+       RETURNING id`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Safety procedure not found' });
+    }
+
+    res.json({ message: 'Safety procedure deleted successfully' });
+  } catch (err) {
+    console.error('Error deleting safety procedure:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -6700,6 +7242,334 @@ app.get('/api/work-areas/:workAreaId/photos', async (req, res) => {
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching photos:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============= DRAWINGS ENDPOINTS =============
+
+// Get presigned URL for uploading drawings
+app.post('/api/work-areas/:workAreaId/drawings/presigned-url', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { fileName, fileType } = req.body;
+
+  try {
+    const result = await generatePresignedUrl(fileName, fileType, `work-areas/${workAreaId}/drawings`);
+    res.json(result);
+  } catch (err) {
+    console.error('Error generating presigned URL for drawing:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Save drawing metadata
+app.post('/api/work-areas/:workAreaId/drawings', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { title, revision, file_url, description, uploaded_by } = req.body;
+
+  try {
+    // Create drawings table if it doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS drawings (
+        id SERIAL PRIMARY KEY,
+        work_area_id UUID NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        revision VARCHAR(50),
+        file_url TEXT NOT NULL,
+        description TEXT,
+        uploaded_by VARCHAR(255),
+        uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        file_size BIGINT,
+        file_type VARCHAR(100),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Insert drawing metadata
+    const result = await pool.query(
+      `INSERT INTO drawings
+       (work_area_id, title, revision, file_url, description, uploaded_by)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [workAreaId, title, revision, file_url, description, uploaded_by]
+    );
+
+    console.log(`Drawing saved for work area ${workAreaId}:`, result.rows[0]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error saving drawing:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get drawings for a work area
+app.get('/api/work-areas/:workAreaId/drawings', async (req, res) => {
+  const { workAreaId } = req.params;
+
+  try {
+    // Check if drawings table exists
+    const tableExists = await pool.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables
+        WHERE table_name = 'drawings'
+      )
+    `);
+
+    if (!tableExists.rows[0].exists) {
+      return res.json([]);
+    }
+
+    const result = await pool.query(
+      'SELECT * FROM drawings WHERE work_area_id = $1 ORDER BY uploaded_at DESC',
+      [workAreaId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching drawings:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete a drawing
+app.delete('/api/work-areas/:workAreaId/drawings/:drawingId', async (req, res) => {
+  const { workAreaId, drawingId } = req.params;
+
+  try {
+    const result = await pool.query(
+      'DELETE FROM drawings WHERE id = $1 AND work_area_id = $2 RETURNING *',
+      [drawingId, workAreaId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Drawing not found' });
+    }
+
+    console.log(`Deleted drawing ${drawingId} from work area ${workAreaId}`);
+    res.json({ success: true, deleted: result.rows[0] });
+  } catch (err) {
+    console.error('Error deleting drawing:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============= RFI ENDPOINTS =============
+
+// Get RFIs for a work area
+app.get('/api/work-areas/:workAreaId/rfis', async (req, res) => {
+  const { workAreaId } = req.params;
+
+  try {
+    // Create RFI table if it doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS rfis (
+        id SERIAL PRIMARY KEY,
+        work_area_id UUID NOT NULL,
+        question TEXT NOT NULL,
+        answer TEXT,
+        status VARCHAR(50) DEFAULT 'pending',
+        created_by VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        answered_by VARCHAR(255),
+        answered_at TIMESTAMP,
+        attachments TEXT[],
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    const result = await pool.query(
+      'SELECT * FROM rfis WHERE work_area_id = $1 ORDER BY created_at DESC',
+      [workAreaId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching RFIs:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create new RFI
+app.post('/api/work-areas/:workAreaId/rfis', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { question, created_by } = req.body;
+
+  try {
+    // Ensure table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS rfis (
+        id SERIAL PRIMARY KEY,
+        work_area_id UUID NOT NULL,
+        question TEXT NOT NULL,
+        answer TEXT,
+        status VARCHAR(50) DEFAULT 'pending',
+        created_by VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        answered_by VARCHAR(255),
+        answered_at TIMESTAMP,
+        attachments TEXT[],
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    const result = await pool.query(
+      `INSERT INTO rfis (work_area_id, question, created_by, status)
+       VALUES ($1, $2, $3, 'pending')
+       RETURNING *`,
+      [workAreaId, question, created_by]
+    );
+
+    console.log(`RFI created for work area ${workAreaId}:`, result.rows[0]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error creating RFI:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update RFI (answer)
+app.put('/api/work-areas/:workAreaId/rfis/:rfiId', async (req, res) => {
+  const { workAreaId, rfiId } = req.params;
+  const { answer, answered_by, status } = req.body;
+
+  try {
+    const result = await pool.query(
+      `UPDATE rfis
+       SET answer = $1, answered_by = $2, status = $3, answered_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $4 AND work_area_id = $5
+       RETURNING *`,
+      [answer, answered_by, status || 'answered', rfiId, workAreaId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'RFI not found' });
+    }
+
+    console.log(`RFI ${rfiId} updated for work area ${workAreaId}`);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error updating RFI:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete RFI
+app.delete('/api/work-areas/:workAreaId/rfis/:rfiId', async (req, res) => {
+  const { workAreaId, rfiId } = req.params;
+
+  try {
+    const result = await pool.query(
+      'DELETE FROM rfis WHERE id = $1 AND work_area_id = $2 RETURNING *',
+      [rfiId, workAreaId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'RFI not found' });
+    }
+
+    console.log(`Deleted RFI ${rfiId} from work area ${workAreaId}`);
+    res.json({ success: true, deleted: result.rows[0] });
+  } catch (err) {
+    console.error('Error deleting RFI:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============= SITE INSTRUCTIONS ENDPOINTS =============
+
+// Get instructions for a work area
+app.get('/api/work-areas/:workAreaId/instructions', async (req, res) => {
+  const { workAreaId } = req.params;
+
+  try {
+    // Create instructions table if it doesn't exist
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS site_instructions (
+        id SERIAL PRIMARY KEY,
+        work_area_id UUID NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        instruction TEXT NOT NULL,
+        issued_by VARCHAR(255),
+        issued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        acknowledged BOOLEAN DEFAULT false,
+        acknowledged_by VARCHAR(255),
+        acknowledged_at TIMESTAMP,
+        attachments TEXT[],
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    const result = await pool.query(
+      'SELECT * FROM site_instructions WHERE work_area_id = $1 ORDER BY issued_at DESC',
+      [workAreaId]
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching instructions:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create new instruction
+app.post('/api/work-areas/:workAreaId/instructions', async (req, res) => {
+  const { workAreaId } = req.params;
+  const { title, instruction, issued_by } = req.body;
+
+  try {
+    // Ensure table exists
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS site_instructions (
+        id SERIAL PRIMARY KEY,
+        work_area_id UUID NOT NULL,
+        title VARCHAR(255) NOT NULL,
+        instruction TEXT NOT NULL,
+        issued_by VARCHAR(255),
+        issued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        acknowledged BOOLEAN DEFAULT false,
+        acknowledged_by VARCHAR(255),
+        acknowledged_at TIMESTAMP,
+        attachments TEXT[],
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    const result = await pool.query(
+      `INSERT INTO site_instructions (work_area_id, title, instruction, issued_by)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [workAreaId, title, instruction, issued_by]
+    );
+
+    console.log(`Instruction created for work area ${workAreaId}:`, result.rows[0]);
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('Error creating instruction:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete instruction
+app.delete('/api/work-areas/:workAreaId/instructions/:instructionId', async (req, res) => {
+  const { workAreaId, instructionId } = req.params;
+
+  try {
+    const result = await pool.query(
+      'DELETE FROM site_instructions WHERE id = $1 AND work_area_id = $2 RETURNING *',
+      [instructionId, workAreaId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Instruction not found' });
+    }
+
+    console.log(`Deleted instruction ${instructionId} from work area ${workAreaId}`);
+    res.json({ success: true, deleted: result.rows[0] });
+  } catch (err) {
+    console.error('Error deleting instruction:', err);
     res.status(500).json({ error: err.message });
   }
 });
