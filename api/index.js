@@ -6843,7 +6843,7 @@ app.get('/api/work-areas/:workAreaId/daily-tasks', async (req, res) => {
     const result = await pool.query(
       `SELECT * FROM daily_tasks
        WHERE work_area_id = $1 AND task_date = $2
-       ORDER BY sequence_order, created_at`,
+       ORDER BY updated_at DESC, created_at DESC`,
       [workAreaId, date]
     );
     res.json(result.rows);
